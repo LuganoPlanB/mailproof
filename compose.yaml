@@ -1,0 +1,128 @@
+name: mailproof
+
+x-owned-image: &owned-image
+  args:
+    DEBIAN_BASE: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
+
+services:
+  init:
+    image: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    environment:
+      MAILPROOF_REPORT_RECIPIENT: ${MAILPROOF_REPORT_RECIPIENT:-operator@example.org}
+    volumes:
+      - ./containers/init/entrypoint.sh:/entrypoint.sh:ro
+      - ./runtime:/runtime
+    restart: "no"
+
+  postfix:
+    build:
+      <<: *owned-image
+      context: .
+      dockerfile: containers/postfix/Dockerfile
+      args:
+        DEBIAN_BASE: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
+        POSTFIX_VERSION: ${POSTFIX_VERSION:-3.10.13-0+deb13u1}
+        CA_CERTIFICATES_VERSION: ${CA_CERTIFICATES_VERSION:-20250419}
+        DEBIAN_SNAPSHOT: ${DEBIAN_SNAPSHOT:-20260814T000000Z}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      dovecot:
+        condition: service_healthy
+    ports:
+      - "${MAILPROOF_SMTP_PORT:-2525}:25"
+    networks: [smtp, lmtp]
+    volumes:
+      - ./config/postfix/main.cf:/etc/postfix/main.cf:ro
+      - ./runtime:/runtime
+      - postfix-log:/var/log/mailproof
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "postfix status"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    logging:
+      options: {max-size: "${MAILPROOF_LOG_MAX_SIZE:-10m}", max-file: "${MAILPROOF_LOG_MAX_FILE:-3}"}
+
+  dovecot:
+    build:
+      <<: *owned-image
+      context: .
+      dockerfile: containers/dovecot/Dockerfile
+      args:
+        DEBIAN_BASE: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
+        DOVECOT_VERSION: ${DOVECOT_VERSION:-1:2.4.1+dfsg1-6+deb13u6}
+        DEBIAN_SNAPSHOT: ${DEBIAN_SNAPSHOT:-20260814T000000Z}
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    networks: [lmtp]
+    volumes:
+      - ./config/dovecot/dovecot.conf:/etc/dovecot/dovecot.conf:ro
+      - maildir:/var/mail/verification
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "doveadm service status lmtp >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    logging:
+      options: {max-size: "${MAILPROOF_LOG_MAX_SIZE:-10m}", max-file: "${MAILPROOF_LOG_MAX_FILE:-3}"}
+
+  collector:
+    build:
+      <<: *owned-image
+      context: .
+      dockerfile: containers/collector/Dockerfile
+    depends_on:
+      dovecot:
+        condition: service_healthy
+    networks: [lmtp]
+    volumes:
+      - maildir:/var/mail/verification:ro
+      - artifacts:/artifacts
+      - state:/state
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -d /artifacts && test -d /state"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    logging:
+      options: {max-size: "${MAILPROOF_LOG_MAX_SIZE:-10m}", max-file: "${MAILPROOF_LOG_MAX_FILE:-3}"}
+
+  smoke:
+    profiles: [smoke]
+    build:
+      <<: *owned-image
+      context: .
+      dockerfile: containers/smoke/Dockerfile
+      args:
+        DEBIAN_BASE: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
+        NETCAT_OPENBSD_VERSION: ${NETCAT_OPENBSD_VERSION:-1.229-1}
+        DEBIAN_SNAPSHOT: ${DEBIAN_SNAPSHOT:-20260814T000000Z}
+    depends_on:
+      postfix:
+        condition: service_healthy
+      dovecot:
+        condition: service_healthy
+    environment:
+      MAILPROOF_VERIFY_RECIPIENT: ${MAILPROOF_VERIFY_RECIPIENT:-verify@mailproof.test}
+      MAILPROOF_SMOKE_MESSAGE_ID: ${MAILPROOF_SMOKE_MESSAGE_ID:-mailproof-smoke}
+    networks: [smtp]
+    volumes:
+      - maildir:/var/mail/verification:ro
+    restart: "no"
+
+networks:
+  smtp: {}
+  lmtp:
+    internal: true
+
+volumes:
+  maildir: {}
+  artifacts: {}
+  state: {}
+  postfix-log: {}

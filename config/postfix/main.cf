@@ -1,0 +1,17 @@
+compatibility_level = 3.6
+myhostname = postfix.mailproof.test
+mydestination =
+inet_interfaces = all
+inet_protocols = ipv4
+relayhost =
+relay_domains =
+recipient_delimiter = +
+message_size_limit = 52428800
+smtp_tls_security_level = may
+smtpd_tls_security_level = may
+smtpd_relay_restrictions = reject_unauth_destination
+smtpd_recipient_restrictions = reject_unauth_destination
+virtual_transport = lmtp:inet:dovecot:24
+virtual_mailbox_domains = mailproof.test
+virtual_mailbox_maps = static:verification
+maillog_file = /var/log/mailproof/postfix.log

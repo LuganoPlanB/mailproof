@@ -1,0 +1,8 @@
+# Debian 13 (trixie) package snapshot used by the owned images.
+snapshot=20260814T000000Z
+base=debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
+postfix=3.10.13-0+deb13u1
+dovecot-lmtpd=1:2.4.1+dfsg1-6+deb13u6
+dovecot-imapd=1:2.4.1+dfsg1-6+deb13u6
+ca-certificates=20250419
+netcat-openbsd=1.229-1
