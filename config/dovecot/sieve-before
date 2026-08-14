@@ -1,0 +1,11 @@
+require ["fileinto"];
+# Routing only: no authentication, verdict, forwarding, or reply behavior.
+if header :contains "Auto-Submitted" ["auto-replied", "auto-generated"] {
+  fileinto "AutoSubmitted";
+  stop;
+}
+if envelope :is "from" "" {
+  fileinto "NullSender";
+  stop;
+}
+keep;

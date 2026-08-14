@@ -61,6 +61,7 @@ services:
     networks: [lmtp]
     volumes:
       - ./config/dovecot/dovecot.conf:/etc/dovecot/dovecot.conf:ro
+      - ./config/dovecot/sieve-before:/etc/dovecot/sieve-before:ro
       - maildir:/var/mail/verification
     restart: unless-stopped
     healthcheck:
@@ -116,9 +117,44 @@ services:
       - maildir:/var/mail/verification:ro
     restart: "no"
 
+  redis:
+    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT}", PACKAGES: "redis-server=${REDIS_VERSION}"}}
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    environment: {MAILPROOF_ANALYZER_ROLE: redis}
+    networks: [analyzer]
+  unbound:
+    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT}", PACKAGES: "unbound=${UNBOUND_VERSION}"}}
+    networks: [analyzer]
+    environment: {MAILPROOF_ANALYZER_ROLE: unbound}
+  clamav:
+    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT}", PACKAGES: "clamav-daemon=${CLAMAV_VERSION}"}}
+    networks: [analyzer]
+    environment: {MAILPROOF_ANALYZER_ROLE: clamav}
+  olefy:
+    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT}", PACKAGES: "oletools=${OLETOOLS_VERSION}"}}
+    environment: {MAILPROOF_ANALYZER_ROLE: olefy}
+    healthcheck: {test: ["CMD-SHELL", "python3 -c 'import socket; s=socket.create_connection((\"127.0.0.1\",10050),2); s.close()'"], interval: 10s, timeout: 3s, retries: 6}
+    networks: [analyzer]
+  rspamd:
+    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT}", PACKAGES: "rspamd=${RSPAMD_VERSION}"}}
+    networks: [analyzer, lmtp]
+    environment: {MAILPROOF_ANALYZER_ROLE: rspamd}
+    depends_on:
+      redis: {condition: service_started}
+    volumes:
+      - ./config/rspamd/local.d:/etc/rspamd/local.d:ro
+      - ./config/rspamd/plugins.d:/etc/rspamd/plugins.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "rspamadm configtest"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
 networks:
   smtp: {}
   lmtp:
+    internal: true
+  analyzer:
     internal: true
 
 volumes:
