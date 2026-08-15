@@ -70,8 +70,12 @@ before changing this path or the meaning of evidence.
   remain at least 3 GiB for current signature databases. Do not apply the shared
   512 MiB service limit to `clamav`.
 - Keep healthchecks within the commands actually installed by each minimal
-  image. Postfix and ClamAV intentionally use Bash `/dev/tcp`; their images do
-  not install `nc` or `clamdscan`.
+  image. Postfix, Unbound, and ClamAV intentionally use Bash `/dev/tcp`; the
+  minimal images do not install the previous `nc` or `clamdscan` probes.
+- Unbound requires the pinned `dns-root-data` package and an installed
+  `/var/lib/unbound/root.key` for the Debian default DNSSEC configuration. Its
+  bootstrap capabilities are needed to bind port 53, create runtime files, and
+  drop to the package user.
 - Add focused tests beside changed Go packages. Update Bats/contract tests for
   observable shell or Compose changes. Update an ADR when changing an accepted
   evidence or capability decision.

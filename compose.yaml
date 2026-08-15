@@ -184,10 +184,13 @@ services:
     logging: *logging
 
   unbound:
-    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT:-20260814T000000Z}", PACKAGES: "unbound=${UNBOUND_VERSION:-1.22.0-2+deb13u3}"}}
+    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT:-20260814T000000Z}", PACKAGES: "unbound=${UNBOUND_VERSION:-1.22.0-2+deb13u3} dns-root-data=${DNS_ROOT_DATA_VERSION:-2025080400~deb13u1}"}}
     environment: {MAILPROOF_ANALYZER_ROLE: unbound}
     networks: [analyzer]
-    healthcheck: {test: ["CMD-SHELL", "unbound-control status >/dev/null 2>&1 || nc -zu 127.0.0.1 53"], interval: 5s, timeout: 3s, retries: 12}
+    # Debian's default config creates control/pid files, binds port 53, and
+    # drops to the unbound package user during bootstrap.
+    cap_add: [CHOWN, NET_BIND_SERVICE, SETGID, SETUID]
+    healthcheck: {test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/53"], interval: 5s, timeout: 3s, retries: 12}
     <<: [*hardening, *resources]
     tmpfs: [/tmp, /run]
     logging: *logging

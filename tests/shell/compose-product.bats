@@ -35,7 +35,16 @@
   [ "$status" -eq 0 ]
   config=$output
 
-  run python3 -c 'import json, sys; services=json.loads(sys.argv[1])["services"]; assert "/dev/tcp/127.0.0.1/25" in services["postfix"]["healthcheck"]["test"][-1]; assert "/dev/tcp/127.0.0.1/3310" in services["clamav"]["healthcheck"]["test"][-1]; assert "nPING" in services["clamav"]["healthcheck"]["test"][-1]' "$config"
+  run python3 -c 'import json, sys; services=json.loads(sys.argv[1])["services"]; assert "/dev/tcp/127.0.0.1/25" in services["postfix"]["healthcheck"]["test"][-1]; assert "/dev/tcp/127.0.0.1/53" in services["unbound"]["healthcheck"]["test"][-1]; assert "/dev/tcp/127.0.0.1/3310" in services["clamav"]["healthcheck"]["test"][-1]; assert "nPING" in services["clamav"]["healthcheck"]["test"][-1]' "$config"
+  [ "$status" -eq 0 ]
+}
+
+@test "Unbound has a pinned DNSSEC trust anchor and bootstrap capabilities" {
+  run docker compose --env-file config/versions.env config --format json
+  [ "$status" -eq 0 ]
+  config=$output
+
+  run python3 -c 'import json, sys; service=json.loads(sys.argv[1])["services"]["unbound"]; assert "dns-root-data=2025080400~deb13u1" in service["build"]["args"]["PACKAGES"]; assert set(service["cap_add"]) == {"CHOWN", "NET_BIND_SERVICE", "SETGID", "SETUID"}' "$config"
   [ "$status" -eq 0 ]
 }
 
