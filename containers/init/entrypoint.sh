@@ -16,7 +16,10 @@ fi
 if [[ ! -s ${runtime}/secrets/admission-stamp-hmac-key ]]; then
 	openssl rand -out "${runtime}/secrets/admission-stamp-hmac-key" 32
 fi
-chmod 0600 -- "${runtime}/secrets/submitters.json" "${runtime}/secrets/postfix-recipient-access" "${runtime}/secrets/report-signing-key.pem" "${runtime}/secrets/capability-hmac-key" "${runtime}/secrets/admission-stamp-hmac-key"
+if [[ ! -s ${runtime}/secrets/results-api-token ]]; then
+	openssl rand -hex 32 >"${runtime}/secrets/results-api-token"
+fi
+chmod 0600 -- "${runtime}/secrets/submitters.json" "${runtime}/secrets/postfix-recipient-access" "${runtime}/secrets/report-signing-key.pem" "${runtime}/secrets/capability-hmac-key" "${runtime}/secrets/admission-stamp-hmac-key" "${runtime}/secrets/results-api-token"
 printf '%s\n' "${MAILPROOF_REPORT_RECIPIENT:?MAILPROOF_REPORT_RECIPIENT is required}" >"${runtime}/config/report-recipient"
 chmod 0600 -- "${runtime}/config/report-recipient"
 printf '%s\n' "${MAILPROOF_CLAMAV_PROVISION:-none}" >"${runtime}/config/clamav-provision-mode"

@@ -3,7 +3,10 @@ package queue
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -178,6 +181,23 @@ func recordRejectedCollection(ctx context.Context, db *sql.DB, deliveryID, diges
 	if _, err := tx.ExecContext(ctx, `INSERT INTO rejection_work_items(work_id,decision_id,delivery_id,kind,created_at) VALUES(?,?,?,'notarize',?)`, decisionID+"-notarize", decisionID, deliveryID, now.Unix()); err != nil {
 		return fmt.Errorf("enqueue rejection notarization: %w", err)
 	}
+	canonical, err := json.Marshal(struct {
+		ID         string `json:"id"`
+		Outcome    string `json:"outcome"`
+		Stage      string `json:"stage"`
+		Reason     string `json:"reason"`
+		OccurredAt int64  `json:"occurred_at"`
+	}{decisionID, "rejected", "post_data", reason, now.Unix()})
+	if err != nil {
+		return fmt.Errorf("canonical rejection decision: %w", err)
+	}
+	sum := sha256.Sum256(canonical)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO decision_records(decision_id,delivery_id,occurred_at,outcome,stage,reason_code,policy_version,smtp_class,canonical_json,canonical_digest,notarization_status) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(decision_id) DO NOTHING`, decisionID, deliveryID, now.Unix(), "rejected", "post_data", reason, "v1", 550, canonical, hex.EncodeToString(sum[:]), "queued"); err != nil {
+		return fmt.Errorf("insert rejection projection: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO decision_signing_outbox(decision_id,state,created_at) VALUES(?,'pending',?) ON CONFLICT(decision_id) DO NOTHING`, decisionID, now.Unix()); err != nil {
+		return fmt.Errorf("enqueue decision signing: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit rejected collection: %w", err)
 	}
@@ -217,6 +237,23 @@ func Open(ctx context.Context, path string) (*sql.DB, error) {
 	if err := Migrate(ctx, db); err != nil {
 		db.Close()
 		return nil, err
+	}
+	return db, nil
+}
+
+// OpenReadOnly is for query adapters. It never runs migrations or creates a
+// WAL sidecar, preserving the API's read-only volume boundary.
+func OpenReadOnly(ctx context.Context, path string) (*sql.DB, error) {
+	if path == "" || path == ":memory:" {
+		return nil, errors.New("read-only queue path is required")
+	}
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, fmt.Errorf("open read-only queue database: %w", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping read-only queue database: %w", err)
 	}
 	return db, nil
 }
@@ -281,7 +318,33 @@ CREATE INDEX admission_events_window ON admission_events(submitter_id, admitted_
  outcome TEXT NOT NULL CHECK(outcome IN ('started','accepted','failed','unknown')),
  error_class TEXT NOT NULL DEFAULT '', postfix_queue_id TEXT
 );
-CREATE INDEX report_delivery_attempts_run ON report_delivery_attempts(run_id, attempt_id);`}}
+CREATE INDEX report_delivery_attempts_run ON report_delivery_attempts(run_id, attempt_id);`}, {7, `CREATE TABLE result_records (
+ run_id TEXT PRIMARY KEY REFERENCES runs(run_id), delivery_id TEXT NOT NULL REFERENCES deliveries(delivery_id),
+ submitter_id TEXT, occurred_at INTEGER NOT NULL, verdict TEXT NOT NULL, policy_version TEXT NOT NULL,
+ schema_version TEXT NOT NULL, auth_scope TEXT NOT NULL, selected_subject_status TEXT NOT NULL,
+ unavailable_analyzers INTEGER NOT NULL CHECK(unavailable_analyzers >= 0), risk_summary TEXT NOT NULL,
+ category_summary TEXT NOT NULL, manifest_digest TEXT NOT NULL, manifest_path TEXT NOT NULL,
+ source_artifact_digests TEXT NOT NULL, created_at INTEGER NOT NULL
+);
+CREATE INDEX result_records_page ON result_records(occurred_at DESC, run_id DESC);
+CREATE INDEX result_records_filters ON result_records(verdict, occurred_at DESC, run_id DESC);
+CREATE TABLE decision_records (
+ decision_id TEXT PRIMARY KEY REFERENCES submission_decisions(decision_id), submission_id TEXT,
+ delivery_id TEXT REFERENCES deliveries(delivery_id), submitter_id TEXT, occurred_at INTEGER NOT NULL,
+ outcome TEXT NOT NULL CHECK(outcome IN ('admitted','rejected','deferred')), stage TEXT NOT NULL,
+ reason_code TEXT NOT NULL, policy_version TEXT NOT NULL, selected_subject_domain TEXT NOT NULL DEFAULT '',
+ smtp_class INTEGER NOT NULL, canonical_json BLOB NOT NULL, canonical_digest TEXT NOT NULL,
+ notarization_status TEXT NOT NULL CHECK(notarization_status IN ('queued','published','failed')),
+ notarization_error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX decision_records_page ON decision_records(occurred_at DESC, decision_id DESC);
+CREATE INDEX decision_records_filters ON decision_records(outcome, stage, reason_code, occurred_at DESC, decision_id DESC);
+CREATE TABLE decision_signing_outbox (
+ decision_id TEXT PRIMARY KEY REFERENCES decision_records(decision_id), state TEXT NOT NULL CHECK(state IN ('pending','leased','complete','failed')),
+ attempts INTEGER NOT NULL DEFAULT 0, not_before INTEGER NOT NULL DEFAULT 0, lease_owner TEXT, lease_until INTEGER,
+ last_error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL
+);
+CREATE INDEX decision_signing_outbox_claim ON decision_signing_outbox(state, not_before, lease_until);`}}
 	for _, migration := range migrations {
 		version := migration.version
 		var exists int
