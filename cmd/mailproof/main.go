@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/luganoplanb/mailproof/internal/admission"
+	"github.com/luganoplanb/mailproof/internal/analytics"
 	"github.com/luganoplanb/mailproof/internal/analyzers"
 	"github.com/luganoplanb/mailproof/internal/artifact"
 	"github.com/luganoplanb/mailproof/internal/budget"
@@ -34,6 +35,7 @@ import (
 )
 
 var version = "dev"
+var analyticsClock = time.Now
 
 var errCollectorLeaseHeld = errors.New("collector lease is held")
 
@@ -54,7 +56,7 @@ func exitCode(err error) int {
 }
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: mailproof {version|collect|worker|reporter|results-api|status|inspect|replay|bundle|verify-report|redeliver|submitter|admission}")
+		return errors.New("usage: mailproof {version|collect|worker|reporter|analytics-projector|analytics|results-api|status|inspect|replay|bundle|verify-report|redeliver|submitter|admission}")
 	}
 	switch args[0] {
 	case "version":
@@ -65,6 +67,10 @@ func run(ctx context.Context, args []string) error {
 		return worker(ctx, args[1:])
 	case "reporter":
 		return reporter(ctx, args[1:])
+	case "analytics-projector":
+		return analyticsProjector(ctx, args[1:])
+	case "analytics":
+		return analyticsCommand(ctx, args[1:])
 	case "results-api":
 		return resultsAPI(ctx, args[1:])
 	case "status":
@@ -86,6 +92,220 @@ func run(ctx context.Context, args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func analyticsProjector(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("analytics-projector", flag.ContinueOnError)
+	state := fs.String("state", "/state/mailproof.sqlite", "SQLite state database")
+	once := fs.Bool("once", false, "project one bounded batch and exit")
+	watch := fs.Bool("watch", false, "continue projecting")
+	batch := fs.Int("batch-size", 100, "events per transaction (1..1000)")
+	poll := fs.Duration("poll-interval", time.Second, "idle poll interval")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *once == *watch || *poll <= 0 {
+		return errors.New("analytics-projector requires exactly one of --once or --watch and a positive poll interval")
+	}
+	db, err := queue.Open(ctx, *state)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	owner, err := randomID()
+	if err != nil {
+		return err
+	}
+	ok, err := acquireAnalyticsLease(ctx, db, owner, time.Now(), 30*time.Second)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errCollectorLeaseHeld
+	}
+	defer releaseAnalyticsLease(context.Background(), db, owner)
+	for {
+		ok, err := acquireAnalyticsLease(ctx, db, owner, time.Now(), 30*time.Second)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errCollectorLeaseHeld
+		}
+		n, err := analytics.ProjectOnce(ctx, db, *batch)
+		if err != nil {
+			return err
+		}
+		if *once {
+			return emitStatus("analytics-projector", "completed", n)
+		}
+		select {
+		case <-ctx.Done():
+			return emitStatus("analytics-projector", "stopped", n)
+		case <-time.After(*poll):
+		}
+	}
+}
+
+func acquireAnalyticsLease(ctx context.Context, db *sql.DB, owner string, now time.Time, duration time.Duration) (bool, error) {
+	r, err := db.ExecContext(ctx, `INSERT INTO analytics_projector_lease(singleton,owner,until) VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET owner=excluded.owner,until=excluded.until WHERE analytics_projector_lease.until < ? OR analytics_projector_lease.owner=excluded.owner`, owner, now.Add(duration).Unix(), now.Unix())
+	if err != nil {
+		return false, err
+	}
+	n, err := r.RowsAffected()
+	return n == 1, err
+}
+func releaseAnalyticsLease(ctx context.Context, db *sql.DB, owner string) {
+	_, _ = db.ExecContext(ctx, "DELETE FROM analytics_projector_lease WHERE singleton=1 AND owner=?", owner)
+}
+
+func analyticsCommand(ctx context.Context, args []string) error {
+	if len(args) < 1 || (args[0] != "rebuild" && args[0] != "retain") {
+		return errors.New("usage: mailproof analytics {rebuild|retain} --state=... --dry-run|--confirm")
+	}
+	fs := flag.NewFlagSet("analytics "+args[0], flag.ContinueOnError)
+	state := fs.String("state", "/state/mailproof.sqlite", "SQLite state database")
+	dry := fs.Bool("dry-run", false, "show action without changing state")
+	confirm := fs.Bool("confirm", false, "perform action")
+	from := fs.String("from", "", "UTC inclusive start")
+	to := fs.String("to", "", "UTC exclusive end")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if *dry == *confirm {
+		return errors.New("exactly one of --dry-run or --confirm is required")
+	}
+	parseUTC := func(value string) (time.Time, error) {
+		if value == "" {
+			return time.Time{}, nil
+		}
+		if !strings.HasSuffix(value, "Z") {
+			return time.Time{}, errors.New("analytics bounds must be RFC3339 UTC")
+		}
+		v, err := time.Parse(time.RFC3339, value)
+		if err != nil {
+			return time.Time{}, errors.New("analytics bounds must be RFC3339 UTC")
+		}
+		return v.UTC(), nil
+	}
+	start, err := parseUTC(*from)
+	if err != nil {
+		return err
+	}
+	end, err := parseUTC(*to)
+	if err != nil {
+		return err
+	}
+	if (!start.IsZero()) != (!end.IsZero()) {
+		return errors.New("analytics rebuild requires both --from and --to")
+	}
+	if !start.IsZero() && !start.Before(end) {
+		return errors.New("analytics rebuild requires --from before --to")
+	}
+	if !start.IsZero() && (start.Unix()%86400 != 0 || end.Unix()%86400 != 0) {
+		return errors.New("analytics rebuild bounds must align to UTC day buckets")
+	}
+	if args[0] == "retain" && (!start.IsZero() || !end.IsZero()) {
+		return errors.New("analytics retain does not accept --from/--to")
+	}
+	db, err := queue.Open(ctx, *state)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if *dry && args[0] == "rebuild" {
+		var events int
+		if start.IsZero() {
+			err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM analytics_events").Scan(&events)
+		} else {
+			err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM analytics_events WHERE occurred_at>=? AND occurred_at<?", start.Unix(), end.Unix()).Scan(&events)
+		}
+		if err != nil {
+			return err
+		}
+		return emitStatus("analytics "+args[0], "dry-run", events)
+	}
+	if args[0] == "rebuild" {
+		if !start.IsZero() {
+			if err := analytics.RebuildWindow(ctx, db, start, end); err != nil {
+				return err
+			}
+			return emitStatus("analytics rebuild", "completed", 0)
+		}
+		var first, last int64
+		if err := db.QueryRowContext(ctx, "SELECT COALESCE(MIN(occurred_at),0),COALESCE(MAX(occurred_at),0) FROM analytics_events").Scan(&first, &last); err != nil {
+			return err
+		}
+		if first != 0 {
+			begin := time.Unix(first, 0).UTC().Truncate(24 * time.Hour)
+			end := time.Unix(last, 0).UTC().Truncate(24 * time.Hour).Add(24 * time.Hour)
+			if err := analytics.RebuildWindow(ctx, db, begin, end); err != nil {
+				return err
+			}
+		}
+		return emitStatus("analytics rebuild", "completed", 0)
+	}
+	var backup, cursor, newest int64
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM analytics_backup_markers WHERE verified_at>0 AND manifest_digest<>''").Scan(&backup); err != nil {
+		return err
+	}
+	if backup == 0 {
+		return errors.New("analytics retention requires verified backup marker")
+	}
+	if err := db.QueryRowContext(ctx, "SELECT event_id FROM analytics_cursor WHERE singleton=1").Scan(&cursor); err != nil {
+		return err
+	}
+	if err := db.QueryRowContext(ctx, "SELECT COALESCE(MAX(event_id),0) FROM analytics_events").Scan(&newest); err != nil {
+		return err
+	}
+	if newest > cursor {
+		return errors.New("analytics retention refuses unprojected events")
+	}
+	now := analyticsClock().UTC()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var incomplete int
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM metric_rollups m WHERE m.granularity='minute' AND m.bucket_start<? AND NOT EXISTS (SELECT 1 FROM metric_rollups h WHERE h.granularity='hour' AND h.metric=m.metric AND h.outcome=m.outcome AND h.schema_version=m.schema_version AND h.dimension_key=m.dimension_key AND h.bucket_start=(m.bucket_start/3600)*3600)`, now.AddDate(0, 0, -31).Unix()).Scan(&incomplete); err != nil {
+		return err
+	}
+	if incomplete != 0 {
+		return errors.New("analytics retention refuses incomplete hourly rollups")
+	}
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM metric_rollups h WHERE h.granularity='hour' AND h.bucket_start<? AND NOT EXISTS (SELECT 1 FROM metric_rollups d WHERE d.granularity='day' AND d.metric=h.metric AND d.outcome=h.outcome AND d.schema_version=h.schema_version AND d.dimension_key=h.dimension_key AND d.bucket_start=(h.bucket_start/86400)*86400)`, now.AddDate(0, 0, -366).Unix()).Scan(&incomplete); err != nil {
+		return err
+	}
+	if incomplete != 0 {
+		return errors.New("analytics retention refuses incomplete daily rollups")
+	}
+	if *dry {
+		var eligible int
+		if err = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM analytics_events WHERE occurred_at<? AND event_id<=?", now.AddDate(0, 0, -31).Unix(), cursor).Scan(&eligible); err != nil {
+			return err
+		}
+		return emitStatus("analytics retain", "dry-run", eligible)
+	}
+	// Explicit allow-list: only these analytics projections and source events
+	// are mutable. Lifecycle/result/decision/campaign/policy/audit authority is
+	// intentionally not named by any retention statement.
+	if _, err = tx.ExecContext(ctx, "DELETE FROM metric_rollups WHERE granularity='minute' AND bucket_start<?", now.AddDate(0, 0, -31).Unix()); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "DELETE FROM metric_rollups WHERE granularity='hour' AND bucket_start<?", now.AddDate(0, 0, -366).Unix()); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "DELETE FROM metric_rollups WHERE granularity='day' AND bucket_start<?", now.AddDate(-5, 0, 0).Unix()); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "DELETE FROM analytics_events WHERE occurred_at<? AND event_id<=?", now.AddDate(0, 0, -31).Unix(), cursor); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	return emitStatus("analytics retain", "completed", 0)
 }
 
 func resultsAPI(ctx context.Context, args []string) error {
@@ -737,6 +957,7 @@ func worker(ctx context.Context, args []string) error {
 			continue
 		}
 		idle = time.Second
+		analysisStarted := time.Now()
 		if err := analyzeRun(ctx, db, claimed, *artifacts, *rspamdEndpoint); err != nil {
 			if retryErr := queue.Retry(ctx, db, claimed.ID, "analysis", err.Error(), time.Now().Add(time.Second), 3); retryErr != nil {
 				return retryErr
@@ -744,7 +965,7 @@ func worker(ctx context.Context, args []string) error {
 			processed++
 			continue
 		}
-		if err := queue.FinishAnalysis(ctx, db, claimed.ID, owner); err != nil {
+		if err := queue.FinishAnalysisMeasured(ctx, db, claimed.ID, owner, time.Since(analysisStarted)); err != nil {
 			return err
 		}
 		processed++
