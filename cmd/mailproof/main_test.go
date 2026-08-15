@@ -2,6 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"os"
 	"path/filepath"
@@ -94,18 +100,28 @@ func TestCollectRejectsSecondCollector(t *testing.T) {
 func TestWorkerDrainProcessesDueJobsAndStops(t *testing.T) {
 	dir := t.TempDir()
 	state := filepath.Join(dir, "state.sqlite")
+	artifacts := filepath.Join(dir, "artifacts")
+	message := []byte("From: sender@example.test\r\nSubject: test\r\n\r\nbody\r\n")
+	sum := sha256.Sum256(message)
+	digest := hex.EncodeToString(sum[:])
+	if err := os.MkdirAll(filepath.Join(artifacts, "messages"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(artifacts, "messages", digest+".eml"), message, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	db, err := queue.Open(context.Background(), state)
 	if err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	if err := queue.EnqueueCollection(context.Background(), db, "delivery", "digest", "source", "run", now); err != nil {
+	if err := queue.EnqueueCollection(context.Background(), db, "delivery", digest, "source", "run", now); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := run(context.Background(), []string{"worker", "--drain", "--state", state}); err != nil {
+	if err := run(context.Background(), []string{"worker", "--drain", "--state", state, "--artifacts", artifacts, "--rspamd", "http://127.0.0.1:1"}); err != nil {
 		t.Fatal(err)
 	}
 	db, err = queue.Open(context.Background(), state)
@@ -119,6 +135,73 @@ func TestWorkerDrainProcessesDueJobsAndStops(t *testing.T) {
 	}
 	if stateValue != queue.ReportPending {
 		t.Fatalf("state=%q, want %q", stateValue, queue.ReportPending)
+	}
+	if _, err := os.Stat(filepath.Join(artifacts, "runs", "run", "analysis", "evidence.json")); err != nil {
+		t.Fatalf("analysis evidence was not published: %v", err)
+	}
+}
+
+func TestReporterDrainSignsArtifactsAndSuppressesEmptyRecipient(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "state.sqlite")
+	artifacts := filepath.Join(dir, "artifacts")
+	message := []byte("From: sender@example.test\r\nSubject: report\r\n\r\nbody\r\n")
+	sum := sha256.Sum256(message)
+	digest := hex.EncodeToString(sum[:])
+	if err := os.MkdirAll(filepath.Join(artifacts, "messages"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(artifacts, "messages", digest+".eml"), message, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := queue.Open(context.Background(), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.EnqueueCollection(context.Background(), db, "delivery", digest, "source", "run", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), []string{"worker", "--drain", "--state", state, "--artifacts", artifacts, "--rspamd", "http://127.0.0.1:1"}); err != nil {
+		t.Fatal(err)
+	}
+	_, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := filepath.Join(dir, "report-signing-key.pem")
+	if err := os.WriteFile(key, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recipient := filepath.Join(dir, "recipient")
+	if err := os.WriteFile(recipient, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), []string{"reporter", "--drain", "--state", state, "--artifacts", artifacts, "--signing-key", key, "--report-recipient-file", recipient}); err != nil {
+		t.Fatal(err)
+	}
+	db, err = queue.Open(context.Background(), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var got string
+	if err := db.QueryRow("SELECT state FROM runs WHERE run_id='run'").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != queue.ReplySuppressed {
+		t.Fatalf("state=%q, want %q", got, queue.ReplySuppressed)
+	}
+	for _, name := range []string{"report.json", "report.txt", "report.html", "manifest.json", "manifest.sig"} {
+		if _, err := os.Stat(filepath.Join(artifacts, "runs", "run", "report", name)); err != nil {
+			t.Fatalf("%s missing: %v", name, err)
+		}
 	}
 }
 

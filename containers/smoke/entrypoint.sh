@@ -5,11 +5,24 @@ message_id=${MAILPROOF_SMOKE_MESSAGE_ID:?MAILPROOF_SMOKE_MESSAGE_ID is required}
 recipient=${MAILPROOF_VERIFY_RECIPIENT:?MAILPROOF_VERIFY_RECIPIENT is required}
 expected_delta=${MAILPROOF_SMOKE_EXPECTED_DELTA:-1}
 count_maildir() {
-  find /var/mail/verification -type f -print0 | awk 'BEGIN { RS = "\\0" } END { print NR }'
+  find /var/mail/verification/new -maxdepth 1 -type f -print0 | awk 'BEGIN { RS = "\\0" } END { print NR }'
 }
 
 before=$(count_maildir)
-printf 'EHLO smoke\r\nMAIL FROM:<>\r\nRCPT TO:<%s>\r\nDATA\r\nFrom: smoke@example.test\r\nTo: %s\r\nSubject: Mailproof smoke\r\nMessage-ID: <%s>\r\n\r\nMailproof smoke fixture.\r\n.\r\nQUIT\r\n' "${recipient}" "${recipient}" "${message_id}" | nc -w 10 postfix 25
+# smtplib reads each response before advancing, unlike a one-way nc pipeline.
+MAILPROOF_SMOKE_RECIPIENT=${recipient} MAILPROOF_SMOKE_MESSAGE_ID=${message_id} python3 - <<'PY'
+import os
+import smtplib
+
+recipient = os.environ["MAILPROOF_SMOKE_RECIPIENT"]
+message_id = os.environ["MAILPROOF_SMOKE_MESSAGE_ID"]
+message = (
+    f"From: smoke@example.test\r\nTo: {recipient}\r\nSubject: Mailproof smoke\r\n"
+    f"Message-ID: <{message_id}>\r\n\r\nMailproof smoke fixture.\r\n"
+)
+with smtplib.SMTP("postfix", 25, timeout=15) as client:
+    client.sendmail("", [recipient], message)
+PY
 for _ in $(seq 1 15); do
   after=$(count_maildir)
   if ((after == before + expected_delta)); then

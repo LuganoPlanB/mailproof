@@ -12,7 +12,6 @@ import (
 	"io"
 	"net/http"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/luganoplanb/mailproof/internal/evidence"
@@ -86,14 +85,14 @@ func (c RspamdClient) Analyze(ctx context.Context, request RspamdRequest) (Norma
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return NormalizedRspamd{}, fmt.Errorf("Rspamd scan status %d", response.StatusCode)
+		return NormalizedRspamd{}, fmt.Errorf("rspamd scan status %d", response.StatusCode)
 	}
 	raw, err := io.ReadAll(io.LimitReader(response.Body, c.MaxBytes+1))
 	if err != nil {
 		return NormalizedRspamd{}, fmt.Errorf("read Rspamd response: %w", err)
 	}
 	if int64(len(raw)) > c.MaxBytes {
-		return NormalizedRspamd{}, errors.New("Rspamd response exceeds bound")
+		return NormalizedRspamd{}, errors.New("rspamd response exceeds bound")
 	}
 	return NormalizeRspamd(raw, request)
 }
@@ -143,7 +142,7 @@ func NormalizeRspamd(raw []byte, request RspamdRequest) (NormalizedRspamd, error
 		return NormalizedRspamd{}, fmt.Errorf("decode Rspamd response: %w", err)
 	}
 	if response.Symbols == nil {
-		return NormalizedRspamd{}, errors.New("Rspamd response has no symbols")
+		return NormalizedRspamd{}, errors.New("rspamd response has no symbols")
 	}
 	digest := sha256.Sum256(raw)
 	normalized := NormalizedRspamd{
@@ -248,9 +247,4 @@ func (r NormalizedRspamd) Evidence(request RspamdRequest, rawPath string, observ
 		})
 	}
 	return items
-}
-
-func hasSymbol(symbols map[string]rspamdSymbol, name string) bool {
-	_, ok := symbols[strings.ToUpper(name)]
-	return ok
 }

@@ -40,9 +40,11 @@ func publish(dir, name string, b []byte) error {
 	}
 	tmp := f.Name()
 	defer os.Remove(tmp)
-	if err := f.Chmod(0o440); err == nil {
-		_, err = f.Write(b)
+	if err := f.Chmod(0o440); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("set permissions for %s: %w", name, err)
 	}
+	_, err = f.Write(b)
 	if err == nil {
 		err = f.Sync()
 	}

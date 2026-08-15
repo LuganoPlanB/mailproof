@@ -1,0 +1,21 @@
+name: quality
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  go-and-shell:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with: {go-version: '1.26.6'}
+      - run: go test ./...
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - run: shellcheck --shell=bash scripts/*.sh containers/*/entrypoint.sh
+      - run: docker compose --env-file config/versions.env config --quiet
+      - run: docker compose --env-file config/versions.env build --pull

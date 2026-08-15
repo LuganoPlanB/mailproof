@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -16,8 +17,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/luganoplanb/mailproof/internal/analyzers"
 	"github.com/luganoplanb/mailproof/internal/artifact"
 	"github.com/luganoplanb/mailproof/internal/budget"
+	"github.com/luganoplanb/mailproof/internal/evidence"
 	"github.com/luganoplanb/mailproof/internal/ingress"
 	"github.com/luganoplanb/mailproof/internal/queue"
 	"github.com/luganoplanb/mailproof/internal/report"
@@ -44,7 +47,7 @@ func exitCode(err error) int {
 }
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: mailproof {version|collect|worker|status|inspect|replay|bundle|verify-report|redeliver}")
+		return errors.New("usage: mailproof {version|collect|worker|reporter|status|inspect|replay|bundle|verify-report|redeliver}")
 	}
 	switch args[0] {
 	case "version":
@@ -53,6 +56,8 @@ func run(ctx context.Context, args []string) error {
 		return collect(ctx, args[1:])
 	case "worker":
 		return worker(ctx, args[1:])
+	case "reporter":
+		return reporter(ctx, args[1:])
 	case "status":
 		return status(ctx, args[1:])
 	case "inspect":
@@ -361,6 +366,8 @@ func publishIngress(root, deliveryID, digest, sourceKey string, correlation ingr
 func worker(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("worker", flag.ContinueOnError)
 	state := fs.String("state", "/state/mailproof.sqlite", "SQLite state database")
+	artifacts := fs.String("artifacts", "/artifacts", "artifact root")
+	rspamdEndpoint := fs.String("rspamd", "http://rspamd:11333/checkv3", "Rspamd checkv3 endpoint")
 	drain := fs.Bool("drain", false, "stop when no job is due")
 	maxJobs := fs.Int("max-jobs", 0, "maximum jobs to claim")
 	maxRuntime := fs.Duration("max-runtime", 0, "maximum runtime")
@@ -419,11 +426,194 @@ func worker(ctx context.Context, args []string) error {
 			continue
 		}
 		idle = time.Second
+		if err := analyzeRun(ctx, db, claimed, *artifacts, *rspamdEndpoint); err != nil {
+			if retryErr := queue.Retry(ctx, db, claimed.ID, "analysis", err.Error(), time.Now().Add(time.Second), 3); retryErr != nil {
+				return retryErr
+			}
+			processed++
+			continue
+		}
 		if err := queue.FinishAnalysis(ctx, db, claimed.ID, owner); err != nil {
 			return err
 		}
 		processed++
 	}
+}
+
+func analyzeRun(ctx context.Context, db *sql.DB, run *queue.Run, root, rspamdEndpoint string) error {
+	var deliveredDigest string
+	if err := db.QueryRowContext(ctx, "SELECT message_digest FROM deliveries WHERE delivery_id=?", run.DeliveryID).Scan(&deliveredDigest); err != nil {
+		return fmt.Errorf("find delivery digest: %w", err)
+	}
+	message, err := os.ReadFile(filepath.Join(root, "messages", deliveredDigest+".eml"))
+	if err != nil {
+		return fmt.Errorf("read sealed message: %w", err)
+	}
+	selection, err := evidence.SelectTopLevelRFC822(message, deliveredDigest, root)
+	if err != nil {
+		return err
+	}
+	if selection.SubjectDigest == "" && selection.SelectionError == "" {
+		selection.SubjectDigest = deliveredDigest
+		selection.Scope = evidence.LocalIngress
+	}
+	if err := publishJSON(filepath.Join(root, "deliveries", run.DeliveryID, "subjects.json"), selection); err != nil {
+		return err
+	}
+	items := []evidence.Evidence{}
+	contradictions := []evidence.Contradiction{}
+	if selection.SelectionError != "" {
+		items = append(items, unavailableEvidence("subject-selection", deliveredDigest, selection.SelectionError))
+	} else {
+		subject, readErr := os.ReadFile(filepath.Join(root, "messages", selection.SubjectDigest+".eml"))
+		if readErr != nil {
+			return fmt.Errorf("read selected subject: %w", readErr)
+		}
+		request := analyzers.RspamdRequest{Scope: selection.Scope, Message: subject, SubjectDigest: selection.SubjectDigest, ConfigDigest: runtimeDigest(), AdapterVersion: "checkv3"}
+		normalized, scanErr := (analyzers.RspamdClient{Endpoint: rspamdEndpoint, MaxBytes: 8 << 20}).Analyze(ctx, request)
+		if scanErr != nil {
+			items = append(items, unavailableEvidence("rspamd", selection.SubjectDigest, scanErr.Error()))
+		} else {
+			items = append(items, normalized.Evidence(request, "", time.Now())...)
+		}
+		projection, projectErr := evidence.Project(subject, selection.SubjectDigest)
+		if projectErr == nil {
+			contradictions = append(contradictions, evidence.SenderAmbiguities(projection)...)
+		}
+	}
+	verdict := evidence.Decide(selection.Scope, items, contradictions)
+	if selection.SelectionError != "" {
+		verdict = evidence.Verdict{Category: evidence.Indeterminate, Technical: "indeterminate", Behavior: "indeterminate", Unavailable: []string{"subject-selection"}, Rules: []string{"multiple-top-level-rfc822"}, Support: []string{}, Contradictions: []string{}}
+	}
+	return evidence.PublishAnalysis(root, run.ID, items, verdict)
+}
+
+func unavailableEvidence(id, digest, reason string) evidence.Evidence {
+	return evidence.Evidence{ID: id, Category: id, Adapter: "mailproof", AdapterVersion: version, ConfigDigest: runtimeDigest(), SubjectDigest: digest, InputDigest: digest, ObservedAt: time.Now().UTC(), Value: json.RawMessage(`{"status":"unavailable"}`), Status: evidence.Unavailable, Authority: evidence.Weak, Limitations: []string{}, Error: reason}
+}
+
+func runtimeDigest() string {
+	sum := sha256.Sum256([]byte("mailproof-runtime-v1"))
+	return hex.EncodeToString(sum[:])
+}
+
+func publishJSON(path string, value any) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	b, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(b, '\n'), 0o440)
+}
+
+func reporter(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("reporter", flag.ContinueOnError)
+	state := fs.String("state", "/state/mailproof.sqlite", "SQLite state database")
+	artifacts := fs.String("artifacts", "/artifacts", "artifact root")
+	keyPath := fs.String("signing-key", "/runtime/secrets/report-signing-key.pem", "Ed25519 signing key")
+	recipientPath := fs.String("report-recipient-file", "/runtime/config/report-recipient", "registered report recipient")
+	smtpAddress := fs.String("smtp", "postfix:25", "internal Postfix submission listener")
+	drain := fs.Bool("drain", false, "stop when no report is due")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	db, err := queue.Open(ctx, *state)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	owner, err := randomID()
+	if err != nil {
+		return err
+	}
+	for {
+		run, err := queue.Claim(ctx, db, owner, "report", time.Now(), budget.Default().WorkerLease)
+		if err != nil {
+			return err
+		}
+		if run == nil {
+			if *drain {
+				return emitStatus("reporter", "drained", 0)
+			}
+			select {
+			case <-ctx.Done():
+				return emitStatus("reporter", "stopped", 0)
+			case <-time.After(time.Second):
+				continue
+			}
+		}
+		terminal, unknown, err := reportRun(ctx, db, run, *artifacts, *keyPath, *recipientPath, *smtpAddress)
+		if err != nil {
+			if unknown {
+				err = queue.QuarantineReply(ctx, db, run.ID, owner, "smtp_outcome_unknown: "+err.Error())
+			} else {
+				err = queue.Retry(ctx, db, run.ID, "report", err.Error(), time.Now().Add(time.Second), 3)
+			}
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		if err := queue.FinishReport(ctx, db, run.ID, owner, terminal); err != nil {
+			return err
+		}
+	}
+}
+
+func reportRun(ctx context.Context, db *sql.DB, run *queue.Run, root, keyPath, recipientPath, smtpAddress string) (string, bool, error) {
+	var digest string
+	if err := db.QueryRowContext(ctx, "SELECT message_digest FROM deliveries WHERE delivery_id=?", run.DeliveryID).Scan(&digest); err != nil {
+		return "", false, err
+	}
+	var verdict evidence.Verdict
+	if raw, err := os.ReadFile(filepath.Join(root, "runs", run.ID, "analysis", "verdict.json")); err != nil || json.Unmarshal(raw, &verdict) != nil {
+		return "", false, errors.New("read analysis verdict")
+	}
+	reportInput := report.Input{RunID: run.ID, DeliveryID: run.DeliveryID, DeliveredOriginalDigest: digest, AuthContextScope: evidence.LocalIngress, Verdict: verdict, PolicyVersion: "v1", ToolVersions: []string{version}, MissingAnalyzers: verdict.Unavailable, Timeline: []report.TimelineEvent{{Kind: "analysis", Claim: "sealed analysis published"}}}
+	documents, err := report.Publish(root, reportInput)
+	if err != nil {
+		return "", false, err
+	}
+	keyBytes, err := os.ReadFile(keyPath)
+	if err != nil {
+		return "", false, err
+	}
+	key, _, err := report.ParsePrivateKey(keyBytes)
+	if err != nil {
+		return "", false, err
+	}
+	manifest := report.Manifest{Schema: report.ManifestSchema, DeliveryID: run.DeliveryID, DeliveredOriginal: digest, ReportJSON: evidence.Digest(documents["report.json"]), ReportText: evidence.Digest(documents["report.txt"]), ReportHTML: evidence.Digest(documents["report.html"]), Policy: runtimeDigest(), Config: runtimeDigest(), IssuedAt: time.Now().UTC(), KeyID: "pending"}
+	if err := report.SignAndPublish(root, run.ID, manifest, key); err != nil {
+		return "", false, err
+	}
+	recipientBytes, err := os.ReadFile(recipientPath)
+	if err != nil {
+		return "", false, err
+	}
+	recipient := strings.TrimSpace(string(recipientBytes))
+	if recipient == "" {
+		return queue.ReplySuppressed, false, nil
+	}
+	manifestBytes, err := os.ReadFile(filepath.Join(root, "runs", run.ID, "report", "manifest.json"))
+	if err != nil {
+		return "", false, err
+	}
+	signature, err := os.ReadFile(filepath.Join(root, "runs", run.ID, "report", "manifest.sig"))
+	if err != nil {
+		return "", false, err
+	}
+	unknown, err := report.Submit(ctx, smtpAddress, report.Reply{EnvelopeFrom: "", Recipient: recipient, DeliveryID: run.DeliveryID, Manifest: manifestBytes, Signature: signature, ReportText: documents["report.txt"], ReportHTML: documents["report.html"], ReportJSON: documents["report.json"]})
+	if err != nil {
+		return "", unknown, err
+	}
+	return queue.Complete, false, nil
 }
 
 func emitStatus(command, status string, count int) error {

@@ -1,0 +1,4 @@
+# Every exception needs a named owner, expiry, rationale, and compensating control.
+# The empty list is intentional: CI fails closed when a scanner finding is suppressed
+# without being entered here.
+exceptions: []

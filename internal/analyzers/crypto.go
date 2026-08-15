@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/luganoplanb/mailproof/internal/evidence"
@@ -144,16 +143,4 @@ func (r CryptoResult) Evidence(subjectDigest, configDigest, rawPath string, obse
 		category = "openpgp"
 	}
 	return evidence.Evidence{ID: "crypto-" + category, Category: category, Adapter: r.Format, AdapterVersion: r.ToolVersion, ConfigDigest: configDigest, SubjectDigest: subjectDigest, InputDigest: subjectDigest, ObservedAt: observedAt.UTC(), Value: value, RawResponsePath: rawPath, Status: r.Status, Authority: evidence.Strong, Limitations: append([]string{}, r.Limitations...)}, nil
-}
-
-func isMountedReadOnly(path string) bool {
-	info, err := os.Stat(path)
-	if err != nil {
-		return false
-	}
-	return info.Mode().Perm()&0o222 == 0
-}
-
-func sanitizeToolOutput(value string) string {
-	return strings.ReplaceAll(strings.ReplaceAll(value, "\r", " "), "\n", " ")
 }

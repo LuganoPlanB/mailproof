@@ -1,184 +1,291 @@
 name: mailproof
 
-x-owned-image: &owned-image
-  args:
-    DEBIAN_BASE: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
+# Docker Engine 27.0+ and Docker Compose v2.30+ are the tested minimums.
+# Every base image and Debian package is pinned in config/versions.env.
+x-logging: &logging
+  driver: local
+  options:
+    max-size: "${MAILPROOF_LOG_MAX_SIZE:-10m}"
+    max-file: "${MAILPROOF_LOG_MAX_FILE:-3}"
+x-hardening: &hardening
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  read_only: true
+  pids_limit: 256
+x-resources: &resources
+  deploy:
+    resources:
+      limits: {cpus: "1.0", memory: 512M, pids: 256}
+x-mailproof-build: &mailproof-build
+  context: .
+  dockerfile: containers/mailproof/Dockerfile
 
 services:
   init:
-    image: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
+    build:
+      context: .
+      dockerfile: containers/init/Dockerfile
+      args:
+        DEBIAN_BASE: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
+        DEBIAN_SNAPSHOT: ${DEBIAN_SNAPSHOT:-20260814T000000Z}
+        OPENSSL_VERSION: ${OPENSSL_VERSION:-3.5.6-1~deb13u2}
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     environment:
       MAILPROOF_REPORT_RECIPIENT: ${MAILPROOF_REPORT_RECIPIENT:-operator@example.org}
+      MAILPROOF_VERIFY_RECIPIENT: ${MAILPROOF_VERIFY_RECIPIENT:-verify@mailproof.test}
+      MAILPROOF_CLAMAV_PROVISION: ${MAILPROOF_CLAMAV_PROVISION:-none}
     volumes:
       - ./containers/init/entrypoint.sh:/entrypoint.sh:ro
-      - ./runtime:/runtime
+      - runtime:/runtime
+      - clamav-db:/clamav-db
+      - artifacts:/artifacts
+      - state:/state
+      - reports:/reports
+      - maildir:/var/mail/verification
+      - postfix-log:/var/log/mailproof
     restart: "no"
+    logging: *logging
 
   postfix:
     build:
-      <<: *owned-image
       context: .
       dockerfile: containers/postfix/Dockerfile
       args:
         DEBIAN_BASE: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
-        POSTFIX_VERSION: ${POSTFIX_VERSION:-3.10.13-0+deb13u1}
+        POSTFIX_VERSION: ${POSTFIX_VERSION:-3.10.11-0+deb13u1}
         CA_CERTIFICATES_VERSION: ${CA_CERTIFICATES_VERSION:-20250419}
         DEBIAN_SNAPSHOT: ${DEBIAN_SNAPSHOT:-20260814T000000Z}
     depends_on:
-      init:
-        condition: service_completed_successfully
-      dovecot:
-        condition: service_healthy
-    ports:
-      - "${MAILPROOF_SMTP_PORT:-2525}:25"
-    networks: [smtp, lmtp]
+      init: {condition: service_completed_successfully}
+      dovecot: {condition: service_healthy}
+    ports: ["${MAILPROOF_SMTP_PORT:-2525}:25"]
+    networks: [public, mail, report]
     volumes:
       - ./config/postfix/main.cf:/etc/postfix/main.cf:ro
-      - ./runtime:/runtime
+      - runtime:/runtime:ro
       - postfix-log:/var/log/mailproof
+    tmpfs: [/tmp]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "postfix status"]
+      test: ["CMD-SHELL", "postfix status >/dev/null && nc -z 127.0.0.1 25"]
       interval: 5s
       timeout: 3s
       retries: 12
-    logging:
-      options: {max-size: "${MAILPROOF_LOG_MAX_SIZE:-10m}", max-file: "${MAILPROOF_LOG_MAX_FILE:-3}"}
+    logging: *logging
 
   dovecot:
     build:
-      <<: *owned-image
       context: .
       dockerfile: containers/dovecot/Dockerfile
       args:
         DEBIAN_BASE: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
         DOVECOT_VERSION: ${DOVECOT_VERSION:-1:2.4.1+dfsg1-6+deb13u6}
         DEBIAN_SNAPSHOT: ${DEBIAN_SNAPSHOT:-20260814T000000Z}
-    depends_on:
-      init:
-        condition: service_completed_successfully
-    networks: [lmtp]
+    depends_on: {init: {condition: service_completed_successfully}}
+    networks: [mail]
     volumes:
       - ./config/dovecot/dovecot.conf:/etc/dovecot/dovecot.conf:ro
       - ./config/dovecot/sieve-before:/etc/dovecot/sieve-before:ro
       - maildir:/var/mail/verification
+    tmpfs: [/tmp]
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "doveadm service status lmtp >/dev/null"]
       interval: 5s
       timeout: 3s
       retries: 12
-    logging:
-      options: {max-size: "${MAILPROOF_LOG_MAX_SIZE:-10m}", max-file: "${MAILPROOF_LOG_MAX_FILE:-3}"}
+    logging: *logging
 
   collector:
-    build:
-      <<: *owned-image
-      context: .
-      dockerfile: containers/mailproof/Dockerfile
-    command: ["collect", "--watch"]
-    depends_on:
-      dovecot:
-        condition: service_healthy
-    networks: [lmtp]
+    build: *mailproof-build
+    command: ["collect", "--watch", "--postfix-log", "/postfix-log/ingress.log", "--token-registry", "/runtime/secrets/token-registry.json"]
+    depends_on: {dovecot: {condition: service_healthy}}
+    networks: [mail]
     volumes:
       - maildir:/var/mail/verification:ro
       - artifacts:/artifacts
       - state:/state
+      - postfix-log:/postfix-log:ro
+      - runtime:/runtime:ro
+    <<: [*hardening, *resources]
+    tmpfs: [/tmp]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "sh", "-c", "test -d /artifacts && test -d /state"]
+      test: ["CMD-SHELL", "test -f /state/mailproof.sqlite || test -d /artifacts"]
       interval: 5s
       timeout: 3s
       retries: 12
-    logging:
-      options: {max-size: "${MAILPROOF_LOG_MAX_SIZE:-10m}", max-file: "${MAILPROOF_LOG_MAX_FILE:-3}"}
+    logging: *logging
 
   worker:
-    build:
-      <<: *owned-image
-      context: .
-      dockerfile: containers/mailproof/Dockerfile
+    build: *mailproof-build
     command: ["worker"]
     depends_on:
-      collector:
-        condition: service_healthy
+      collector: {condition: service_healthy}
+      rspamd: {condition: service_healthy}
+      unbound: {condition: service_healthy}
+    networks: [analyzer]
     volumes:
-      - artifacts:/artifacts:ro
+      # Sealed messages and deliveries are immutable by convention; workers
+      # publish only their own runs/<run-id>/analysis directory.
+      - artifacts:/artifacts
       - state:/state
+    <<: [*hardening, *resources]
+    tmpfs: [/tmp]
     restart: unless-stopped
-    deploy:
-      resources:
-        limits: {cpus: "1.0", memory: 512M, pids: 256}
-    logging:
-      options: {max-size: "${MAILPROOF_LOG_MAX_SIZE:-10m}", max-file: "${MAILPROOF_LOG_MAX_FILE:-3}"}
+    logging: *logging
+
+  # Reporter is intentionally isolated from analyzer and public networks. Its
+  # private key is available only through the read-only runtime volume.
+  reporter:
+    build: *mailproof-build
+    command: ["reporter"]
+    depends_on:
+      collector: {condition: service_healthy}
+    networks: [report]
+    volumes:
+      - artifacts:/artifacts
+      - state:/state
+      - runtime:/runtime:ro
+    <<: [*hardening, *resources]
+    tmpfs: [/tmp]
+    restart: unless-stopped
+    logging: *logging
 
   smoke:
     profiles: [smoke]
     build:
-      <<: *owned-image
       context: .
       dockerfile: containers/smoke/Dockerfile
       args:
         DEBIAN_BASE: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
         NETCAT_OPENBSD_VERSION: ${NETCAT_OPENBSD_VERSION:-1.229-1}
+        PYTHON3_VERSION: ${PYTHON3_VERSION:-3.13.5-1}
         DEBIAN_SNAPSHOT: ${DEBIAN_SNAPSHOT:-20260814T000000Z}
     depends_on:
-      postfix:
-        condition: service_healthy
-      dovecot:
-        condition: service_healthy
+      postfix: {condition: service_healthy}
+      dovecot: {condition: service_healthy}
     environment:
       MAILPROOF_VERIFY_RECIPIENT: ${MAILPROOF_VERIFY_RECIPIENT:-verify@mailproof.test}
       MAILPROOF_SMOKE_MESSAGE_ID: ${MAILPROOF_SMOKE_MESSAGE_ID:-mailproof-smoke}
-    networks: [smtp]
-    volumes:
-      - maildir:/var/mail/verification:ro
+    networks: [public]
+    volumes: [maildir:/var/mail/verification:ro]
     restart: "no"
+    logging: *logging
 
   redis:
-    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT}", PACKAGES: "redis-server=${REDIS_VERSION}"}}
+    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT:-20260814T000000Z}", PACKAGES: "redis-server=${REDIS_VERSION:-5:8.0.2-3+deb13u2}"}}
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     environment: {MAILPROOF_ANALYZER_ROLE: redis}
     networks: [analyzer]
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s, retries: 12}
+    <<: [*hardening, *resources]
+    tmpfs: [/tmp]
+    logging: *logging
+
   unbound:
-    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT}", PACKAGES: "unbound=${UNBOUND_VERSION}"}}
-    networks: [analyzer]
+    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT:-20260814T000000Z}", PACKAGES: "unbound=${UNBOUND_VERSION:-1.22.0-2+deb13u3}"}}
     environment: {MAILPROOF_ANALYZER_ROLE: unbound}
+    networks: [analyzer]
+    healthcheck: {test: ["CMD-SHELL", "unbound-control status >/dev/null 2>&1 || nc -zu 127.0.0.1 53"], interval: 5s, timeout: 3s, retries: 12}
+    <<: [*hardening, *resources]
+    tmpfs: [/tmp, /run]
+    logging: *logging
+
   clamav:
-    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT}", PACKAGES: "clamav-daemon=${CLAMAV_VERSION}"}}
-    networks: [analyzer]
+    depends_on:
+      clamav-db-init: {condition: service_completed_successfully}
+    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT:-20260814T000000Z}", PACKAGES: "clamav-daemon=${CLAMAV_VERSION:-1.4.3+dfsg-1}"}}
     environment: {MAILPROOF_ANALYZER_ROLE: clamav}
+    networks: [scanner]
+    # clamd drops to its package user during startup; these are the minimal
+    # capabilities required for that documented transition.
+    cap_add: [CHOWN, SETGID, SETUID]
+    volumes:
+      - clamav-db:/var/lib/clamav:ro
+      - ./config/clamav/clamd.conf:/etc/clamav/clamd.conf:ro
+    healthcheck: {test: ["CMD-SHELL", "clamdscan --version >/dev/null"], interval: 10s, timeout: 5s, retries: 12}
+    <<: [*hardening, *resources]
+    tmpfs: [/tmp, /run, /var/run/clamav, /var/log/clamav]
+    logging: *logging
+
+  clamav-db-init:
+    build:
+      context: .
+      dockerfile: containers/clamav-provisioner/Dockerfile
+      args:
+        DEBIAN_BASE: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
+        DEBIAN_SNAPSHOT: ${DEBIAN_SNAPSHOT:-20260814T000000Z}
+        CLAMAV_VERSION: ${CLAMAV_VERSION:-1.4.3+dfsg-1}
+        CURL_VERSION: ${CURL_VERSION:-8.14.1-2+deb13u4}
+        CA_CERTIFICATES_VERSION: ${CA_CERTIFICATES_VERSION:-20250419}
+    environment:
+      MAILPROOF_CLAMAV_PROVISION: ${MAILPROOF_CLAMAV_PROVISION:-none}
+      MAILPROOF_CLAMAV_DATABASE: ${MAILPROOF_CLAMAV_DATABASE:-main}
+      MAILPROOF_CLAMAV_DATABASE_URL: ${MAILPROOF_CLAMAV_DATABASE_URL:-}
+      MAILPROOF_CLAMAV_DATABASE_SHA256: ${MAILPROOF_CLAMAV_DATABASE_SHA256:-}
+      MAILPROOF_CLAMAV_DATABASE_VERSION: ${MAILPROOF_CLAMAV_DATABASE_VERSION:-}
+    volumes: [clamav-db:/var/lib/clamav]
+    restart: "no"
+    logging: *logging
+
+  clamav-updater:
+    profiles: [clamav-updater]
+    build:
+      context: .
+      dockerfile: containers/clamav-provisioner/Dockerfile
+      args:
+        DEBIAN_BASE: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
+        DEBIAN_SNAPSHOT: ${DEBIAN_SNAPSHOT:-20260814T000000Z}
+        CLAMAV_VERSION: ${CLAMAV_VERSION:-1.4.3+dfsg-1}
+        CURL_VERSION: ${CURL_VERSION:-8.14.1-2+deb13u4}
+        CA_CERTIFICATES_VERSION: ${CA_CERTIFICATES_VERSION:-20250419}
+    command: [update-loop]
+    environment:
+      MAILPROOF_CLAMAV_PROVISION: ${MAILPROOF_CLAMAV_PROVISION:-none}
+      MAILPROOF_CLAMAV_UPDATE_INTERVAL_SECONDS: ${MAILPROOF_CLAMAV_UPDATE_INTERVAL_SECONDS:-21600}
+    volumes: [clamav-db:/var/lib/clamav]
+    restart: unless-stopped
+    logging: *logging
+
   olefy:
-    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT}", PACKAGES: "oletools=${OLETOOLS_VERSION}"}}
-    environment: {MAILPROOF_ANALYZER_ROLE: olefy}
-    healthcheck: {test: ["CMD-SHELL", "python3 -c 'import socket; s=socket.create_connection((\"127.0.0.1\",10050),2); s.close()'"], interval: 10s, timeout: 3s, retries: 6}
-    networks: [analyzer]
+    build: {context: ., dockerfile: containers/olefy/Dockerfile, args: {PYTHON_BASE: "${PYTHON_OLEFY_BASE:-python@sha256:4c2cf9917bd1cbacc5e9b07320025bdb7cdf2df7b0ceaccb55e9dd7e30987419}"}}
+    networks: [scanner]
+    healthcheck: {test: ["CMD-SHELL", "python3 -c 'import socket; s=socket.create_connection((\"127.0.0.1\",10050),2); s.close()'"], interval: 10s, timeout: 3s, retries: 12}
+    <<: [*hardening, *resources]
+    tmpfs: [/tmp]
+    logging: *logging
+
   rspamd:
-    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT}", PACKAGES: "rspamd=${RSPAMD_VERSION}"}}
-    networks: [analyzer, lmtp]
+    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT:-20260814T000000Z}", PACKAGES: "rspamd=${RSPAMD_VERSION:-3.12.1-1}"}}
     environment: {MAILPROOF_ANALYZER_ROLE: rspamd}
     depends_on:
-      redis: {condition: service_started}
+      redis: {condition: service_healthy}
+      clamav: {condition: service_healthy}
+      olefy: {condition: service_healthy}
+    networks: [analyzer, scanner]
     volumes:
       - ./config/rspamd/local.d:/etc/rspamd/local.d:ro
       - ./config/rspamd/plugins.d:/etc/rspamd/plugins.d:ro
-    healthcheck:
-      test: ["CMD-SHELL", "rspamadm configtest"]
-      interval: 10s
-      timeout: 5s
-      retries: 6
+    # rspamd initializes its runtime/log paths and then drops to _rspamd.
+    cap_add: [CHOWN, SETGID, SETUID]
+    healthcheck: {test: ["CMD-SHELL", "rspamadm configtest && rspamc -h 127.0.0.1:11334 stat >/dev/null"], interval: 10s, timeout: 5s, retries: 12}
+    <<: [*hardening, *resources]
+    tmpfs: [/tmp, /var/log/rspamd, /var/lib/rspamd]
+    logging: *logging
 
 networks:
-  smtp: {}
-  lmtp:
-    internal: true
-  analyzer:
-    internal: true
+  public: {}
+  mail: {internal: true}
+  analyzer: {internal: true}
+  scanner: {internal: true}
+  report: {internal: true}
 
 volumes:
+  runtime: {}
   maildir: {}
   artifacts: {}
+  reports: {}
   state: {}
   postfix-log: {}
+  clamav-db: {}
