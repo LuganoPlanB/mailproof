@@ -1,0 +1,16 @@
+version: 1
+language: en
+limitations:
+  - English-only deterministic business-process rules
+  - weak context only; never authenticity or malware proof
+rules:
+  - id: credential-request
+    phrases: ["confirm your password", "verify your credentials"]
+  - id: payment-destination-change
+    phrases: ["update the bank account", "new payment details"]
+  - id: impersonated-approval-chain
+    phrases: ["approved by the ceo", "executive approval"]
+  - id: gift-card-transfer
+    phrases: ["gift card codes", "bitcoin wallet"]
+  - id: secrecy-process-bypass
+    phrases: ["keep this confidential", "bypass the normal process"]
