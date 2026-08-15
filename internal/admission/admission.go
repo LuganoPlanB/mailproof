@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -226,7 +227,37 @@ func (s Service) reject(ctx context.Context, r Request, stage, reason, submitter
 }
 func (s Service) store(ctx context.Context, tx *sql.Tx, d Decision, r Request, digest []byte, now time.Time) error {
 	_, err := tx.ExecContext(ctx, `INSERT INTO submission_decisions(decision_id,submitter_id,capability_digest,envelope_sender,recipient,peer_ip,helo,spf_outcome,stage,reason_code,policy_version,queue_id,stamp_mac,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, d.ID, nilOr(d.SubmitterID), digest, d.Envelope, d.Recipient, r.ClientAddress, r.Helo, d.SPF, d.Stage, d.Reason, d.PolicyVersion, r.QueueID, keyed(s.StampKey, d.Stamp), nullUnix(d.ExpiresAt), now.Unix())
+	if err != nil {
+		return err
+	}
+	// Stable struct field order is the retained canonical decision representation;
+	// it excludes capabilities, recipient addresses, peer IPs, and stamps.
+	canonical, err := json.Marshal(struct {
+		ID, Outcome, Stage, Reason, Policy string
+		OccurredAt                         int64 `json:"occurred_at"`
+	}{ID: d.ID, Outcome: decisionOutcome(d.Reason), Stage: d.Stage, Reason: d.Reason, Policy: d.PolicyVersion, OccurredAt: now.Unix()})
+	if err != nil {
+		return err
+	}
+	digestText := sha256.Sum256(canonical)
+	status := "queued"
+	if _, err = tx.ExecContext(ctx, `INSERT INTO decision_records(decision_id,submitter_id,occurred_at,outcome,stage,reason_code,policy_version,smtp_class,canonical_json,canonical_digest,notarization_status) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(decision_id) DO NOTHING`, d.ID, nilOr(d.SubmitterID), now.Unix(), decisionOutcome(d.Reason), d.Stage, d.Reason, d.PolicyVersion, smtpClass(d.Reason), canonical, hex.EncodeToString(digestText[:]), status); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO decision_signing_outbox(decision_id,state,created_at) VALUES(?,'pending',?) ON CONFLICT(decision_id) DO NOTHING`, d.ID, now.Unix())
 	return err
+}
+func decisionOutcome(reason string) string {
+	if reason == "admitted" {
+		return "admitted"
+	}
+	return "rejected"
+}
+func smtpClass(reason string) int {
+	if reason == "admitted" {
+		return 250
+	}
+	return 550
 }
 func nilOr(v string) any {
 	if v == "" {

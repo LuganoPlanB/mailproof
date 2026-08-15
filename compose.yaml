@@ -150,6 +150,21 @@ services:
     restart: unless-stopped
     logging: *logging
 
+  # Dashboard consumers join this internal-only network; no host port is
+  # published and the API receives only a read-only state volume and token.
+  results-api:
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-app"
+    command: ["results-api"]
+    depends_on: {init: {condition: service_completed_successfully}}
+    networks: [analytics]
+    volumes:
+      - state:/state:ro
+      - runtime:/runtime:ro
+    <<: [*hardening, *resources]
+    tmpfs: [/tmp]
+    restart: unless-stopped
+    logging: *logging
+
   smoke:
     profiles: [smoke]
     image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-smoke"
@@ -268,6 +283,7 @@ networks:
   analyzer: {internal: true}
   scanner: {internal: true}
   report: {internal: true}
+  analytics: {internal: true}
 
 volumes:
   runtime: {}
