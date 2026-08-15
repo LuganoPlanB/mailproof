@@ -76,7 +76,8 @@ services:
     build:
       <<: *owned-image
       context: .
-      dockerfile: containers/collector/Dockerfile
+      dockerfile: containers/mailproof/Dockerfile
+    command: ["collect", "--watch"]
     depends_on:
       dovecot:
         condition: service_healthy
@@ -91,6 +92,25 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
+    logging:
+      options: {max-size: "${MAILPROOF_LOG_MAX_SIZE:-10m}", max-file: "${MAILPROOF_LOG_MAX_FILE:-3}"}
+
+  worker:
+    build:
+      <<: *owned-image
+      context: .
+      dockerfile: containers/mailproof/Dockerfile
+    command: ["worker"]
+    depends_on:
+      collector:
+        condition: service_healthy
+    volumes:
+      - artifacts:/artifacts:ro
+      - state:/state
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits: {cpus: "1.0", memory: 512M, pids: 256}
     logging:
       options: {max-size: "${MAILPROOF_LOG_MAX_SIZE:-10m}", max-file: "${MAILPROOF_LOG_MAX_FILE:-3}"}
 
