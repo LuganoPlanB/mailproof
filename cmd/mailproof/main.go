@@ -20,6 +20,7 @@ import (
 	"github.com/luganoplanb/mailproof/internal/budget"
 	"github.com/luganoplanb/mailproof/internal/ingress"
 	"github.com/luganoplanb/mailproof/internal/queue"
+	"github.com/luganoplanb/mailproof/internal/report"
 )
 
 var version = "dev"
@@ -43,7 +44,7 @@ func exitCode(err error) int {
 }
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: mailproof {version|collect|worker|status|inspect|replay}")
+		return errors.New("usage: mailproof {version|collect|worker|status|inspect|replay|bundle|verify-report|redeliver}")
 	}
 	switch args[0] {
 	case "version":
@@ -58,9 +59,122 @@ func run(ctx context.Context, args []string) error {
 		return inspect(ctx, args[1:])
 	case "replay":
 		return replay(ctx, args[1:])
+	case "bundle":
+		return bundle(args[1:])
+	case "verify-report":
+		return verifyReport(args[1:])
+	case "redeliver":
+		return redeliver(ctx, args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func bundle(args []string) error {
+	fs := flag.NewFlagSet("bundle", flag.ContinueOnError)
+	artifacts := fs.String("artifacts", "/artifacts", "artifact root")
+	runID := fs.String("run", "", "run ID")
+	output := fs.String("output", "", "bundle directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if !safeID(*runID) || *output == "" {
+		return errors.New("bundle requires a valid --run and --output")
+	}
+	if err := os.MkdirAll(*output, 0o750); err != nil {
+		return fmt.Errorf("create bundle directory: %w", err)
+	}
+	for _, name := range []string{"report.json", "report.txt", "report.html", "manifest.json", "manifest.sig"} {
+		source := filepath.Join(*artifacts, "runs", *runID, "report", name)
+		destination := filepath.Join(*output, name)
+		if err := copyFixed(source, destination); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyReport(args []string) error {
+	fs := flag.NewFlagSet("verify-report", flag.ContinueOnError)
+	bundleDir := fs.String("bundle", "", "offline bundle directory")
+	keys := fs.String("keys", "", "trusted public-key directory")
+	jsonFlag := fs.Bool("json", false, "emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *bundleDir == "" || *keys == "" || !*jsonFlag {
+		return errors.New("verify-report requires --bundle, --keys, and --json")
+	}
+	trusted, err := report.ReadTrustedPublicKeys(*keys)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(report.VerifyBundle(*bundleDir, trusted))
+}
+
+func redeliver(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("redeliver", flag.ContinueOnError)
+	state := fs.String("state", "/state/mailproof.sqlite", "SQLite state database")
+	runID := fs.String("run", "", "run ID")
+	dryRun := fs.Bool("dry-run", false, "show eligible action")
+	confirm := fs.Bool("confirm", false, "return a dead report to the queue")
+	jsonFlag := fs.Bool("json", false, "emit JSON")
+	duplicateRisk := fs.Bool("accept-duplicate-risk", false, "acknowledge unknown post-DATA outcome")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if !safeID(*runID) || !*jsonFlag || *dryRun == *confirm {
+		return errors.New("redeliver requires --run, --json, and exactly one of --dry-run or --confirm")
+	}
+	db, err := queue.Open(ctx, *state)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	var stateValue, lastError string
+	if err := db.QueryRowContext(ctx, "SELECT state,last_error FROM runs WHERE run_id=?", *runID).Scan(&stateValue, &lastError); err != nil {
+		return fmt.Errorf("find report run: %w", err)
+	}
+	if stateValue != queue.ReportDead {
+		return errors.New("redelivery allowed only from report_dead")
+	}
+	if strings.Contains(lastError, "smtp_outcome_unknown") && !*duplicateRisk {
+		return errors.New("unknown SMTP outcome requires --accept-duplicate-risk after Postfix log reconciliation")
+	}
+	if *confirm {
+		if err := queue.Redeliver(ctx, db, *runID); err != nil {
+			return err
+		}
+	}
+	return json.NewEncoder(os.Stdout).Encode(map[string]string{"run_id": *runID, "state": map[bool]string{true: queue.ReportPending, false: queue.ReportDead}[*confirm]})
+}
+
+func safeID(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	for _, r := range id {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func copyFixed(source, destination string) error {
+	if _, err := os.Lstat(destination); err == nil {
+		return fmt.Errorf("bundle destination exists: %s", filepath.Base(destination))
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect bundle destination: %w", err)
+	}
+	contents, err := os.ReadFile(source)
+	if err != nil {
+		return fmt.Errorf("read bundle artifact %s: %w", filepath.Base(source), err)
+	}
+	if err := os.WriteFile(destination, contents, 0o440); err != nil {
+		return fmt.Errorf("write bundle artifact %s: %w", filepath.Base(destination), err)
+	}
+	return nil
 }
 func collect(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("collect", flag.ContinueOnError)

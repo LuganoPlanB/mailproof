@@ -104,7 +104,13 @@ func AcquireCollectorLease(ctx context.Context, db *sql.DB, owner string, now ti
 	n, err := r.RowsAffected()
 	return n == 1, err
 }
-func ReleaseCollectorLease(ctx context.Context, db *sql.DB, owner string) error { _,err:=db.ExecContext(ctx,"DELETE FROM collector_lease WHERE singleton=1 AND owner=?",owner);if err!=nil{return fmt.Errorf("release collector lease: %w",err)};return nil }
+func ReleaseCollectorLease(ctx context.Context, db *sql.DB, owner string) error {
+	_, err := db.ExecContext(ctx, "DELETE FROM collector_lease WHERE singleton=1 AND owner=?", owner)
+	if err != nil {
+		return fmt.Errorf("release collector lease: %w", err)
+	}
+	return nil
+}
 
 func Claim(ctx context.Context, db *sql.DB, owner, phase string, now time.Time, lease time.Duration) (*Run, error) {
 	from, leased := Queued, AnalysisLeased
@@ -215,6 +221,43 @@ func FinishReport(ctx context.Context, db *sql.DB, id, owner, state string) erro
 	n, _ := r.RowsAffected()
 	if n != 1 {
 		return errors.New("report lease not owned")
+	}
+	return nil
+}
+
+// QuarantineReply records an unknowable post-DATA outcome. It is deliberately
+// terminal so a restart cannot create a second automatic SMTP submission.
+func QuarantineReply(ctx context.Context, db *sql.DB, id, owner, message string) error {
+	if len(message) > 1024 {
+		message = message[:1024]
+	}
+	r, err := db.ExecContext(ctx, "UPDATE runs SET state='report_dead',last_error=?,lease_owner=NULL,lease_until=NULL WHERE run_id=? AND state='report_leased' AND lease_owner=?", message, id, owner)
+	if err != nil {
+		return fmt.Errorf("quarantine reply: %w", err)
+	}
+	n, err := r.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("quarantine reply rows affected: %w", err)
+	}
+	if n != 1 {
+		return errors.New("report lease not owned")
+	}
+	return nil
+}
+
+// Redeliver returns only a dead run to the report queue. It never changes an
+// analysis artifact and requires the caller to enforce recipient/token policy.
+func Redeliver(ctx context.Context, db *sql.DB, id string) error {
+	r, err := db.ExecContext(ctx, "UPDATE runs SET state='report_pending',not_before=0,lease_owner=NULL,lease_until=NULL WHERE run_id=? AND state='report_dead'", id)
+	if err != nil {
+		return fmt.Errorf("redeliver report: %w", err)
+	}
+	n, err := r.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("redeliver rows affected: %w", err)
+	}
+	if n != 1 {
+		return errors.New("redelivery allowed only from report_dead")
 	}
 	return nil
 }

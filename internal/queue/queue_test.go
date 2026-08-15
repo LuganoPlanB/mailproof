@@ -135,6 +135,33 @@ func TestReportClaimRenewAndFinish(t *testing.T) {
 	}
 }
 
+func TestUnknownReplyIsQuarantinedAndCanOnlyBeExplicitlyRedelivered(t *testing.T) {
+	db, err := Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now()
+	if _, err := db.Exec(`INSERT INTO deliveries VALUES ('d','x','s',?)`, now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO runs(run_id,delivery_id,state,created_at) VALUES ('r','d','report_pending',?)`, now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Claim(context.Background(), db, "owner", "report", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := QuarantineReply(context.Background(), db, "r", "owner", "smtp_outcome_unknown"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Redeliver(context.Background(), db, "r"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Redeliver(context.Background(), db, "r"); err == nil {
+		t.Fatal("non-dead run was redelivered")
+	}
+}
+
 func TestMigrationRecordsVersion(t *testing.T) {
 	db, err := Open(context.Background(), ":memory:")
 	if err != nil {
