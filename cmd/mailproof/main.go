@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/smtp"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -24,6 +25,7 @@ import (
 	"github.com/luganoplanb/mailproof/internal/ingress"
 	"github.com/luganoplanb/mailproof/internal/queue"
 	"github.com/luganoplanb/mailproof/internal/report"
+	"github.com/luganoplanb/mailproof/internal/submitter"
 )
 
 var version = "dev"
@@ -47,7 +49,7 @@ func exitCode(err error) int {
 }
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: mailproof {version|collect|worker|reporter|status|inspect|replay|bundle|verify-report|redeliver}")
+		return errors.New("usage: mailproof {version|collect|worker|reporter|status|inspect|replay|bundle|verify-report|redeliver|submitter}")
 	}
 	switch args[0] {
 	case "version":
@@ -70,8 +72,126 @@ func run(ctx context.Context, args []string) error {
 		return verifyReport(args[1:])
 	case "redeliver":
 		return redeliver(ctx, args[1:])
+	case "submitter":
+		return submitterCommand(ctx, args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+// postfixMailer is the concrete adapter; enrollment itself only knows Mailer.
+type postfixMailer struct{ address string }
+
+func (m postfixMailer) Send(_ context.Context, to, subject, body string) error {
+	sum := sha256.Sum256([]byte(to + "\x00" + body))
+	message := "To: " + to + "\r\nSubject: " + subject + "\r\nMessage-ID: <mailproof-enrollment-" + hex.EncodeToString(sum[:16]) + "@mailproof>\r\n\r\n" + body
+	return smtp.SendMail(m.address, nil, "", []string{to}, []byte(message))
+}
+
+func submitterCommand(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: mailproof submitter {challenge|activate|list|revoke|rotate}")
+	}
+	fs := flag.NewFlagSet("submitter "+args[0], flag.ContinueOnError)
+	state := fs.String("state", "/state/mailproof.sqlite", "SQLite state database")
+	key := fs.String("capability-key", "/runtime/secrets/capability-hmac-key", "capability HMAC key")
+	keyID := fs.String("capability-key-id", "v1", "capability HMAC key identifier")
+	domain := fs.String("domain", "mailproof.test", "submission address domain")
+	smtpAddress := fs.String("smtp-addr", "postfix:25", "internal Postfix SMTP address")
+	email := fs.String("email", "", "submitter mailbox address")
+	code := fs.String("code", "", "mailbox challenge code")
+	id := fs.String("id", "", "submitter ID")
+	dryRun := fs.Bool("dry-run", false, "show action without changing state")
+	confirm := fs.Bool("confirm", false, "perform state-changing action")
+	jsonFlag := fs.Bool("json", false, "emit JSON")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if !*jsonFlag {
+		return errors.New("submitter commands require --json")
+	}
+	if args[0] != "list" && *dryRun == *confirm {
+		return errors.New("state-changing submitter commands require exactly one of --dry-run or --confirm")
+	}
+	if args[0] == "list" && (*dryRun || *confirm) {
+		return errors.New("submitter list does not accept --dry-run or --confirm")
+	}
+	encode := func(v any) error { return json.NewEncoder(os.Stdout).Encode(v) }
+	if *dryRun {
+		switch args[0] {
+		case "challenge":
+			if _, err := submitter.CanonicalAddress(*email); err != nil {
+				return err
+			}
+			return encode(map[string]any{"email": *email, "would_challenge": true})
+		case "activate":
+			if _, err := submitter.CanonicalAddress(*email); err != nil || *code == "" {
+				return errors.New("submitter activate requires --email and --code")
+			}
+			return encode(map[string]any{"email": *email, "would_activate": true})
+		case "revoke", "rotate":
+			if !safeID(*id) {
+				return fmt.Errorf("submitter %s requires a valid --id", args[0])
+			}
+			return encode(map[string]any{"submitter_id": *id, "would_" + args[0]: true})
+		default:
+			return fmt.Errorf("unknown submitter command %q", args[0])
+		}
+	}
+	keyBytes, err := os.ReadFile(*key)
+	if err != nil {
+		return fmt.Errorf("read capability HMAC key: %w", err)
+	}
+	db, err := queue.Open(ctx, *state)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	svc := submitter.Service{DB: db, Mailer: postfixMailer{address: *smtpAddress}, CapabilityKey: keyBytes, CapabilityKeyID: *keyID, Domain: *domain}
+	switch args[0] {
+	case "challenge":
+		if *email == "" {
+			return errors.New("submitter challenge requires --email")
+		}
+		challenge, err := svc.Challenge(ctx, *email)
+		if err != nil {
+			return err
+		}
+		return encode(map[string]any{"challenge_id": challenge.ID, "submitter_id": challenge.SubmitterID, "expires_at": challenge.ExpiresAt})
+	case "activate":
+		if *email == "" || *code == "" {
+			return errors.New("submitter activate requires --email and --code")
+		}
+		a, err := svc.Activate(ctx, *email, *code)
+		if err != nil {
+			return err
+		}
+		return encode(map[string]any{"submitter": a.Submitter, "submission_address": a.SubmissionAddress})
+	case "list":
+		items, err := svc.List(ctx)
+		if err != nil {
+			return err
+		}
+		return encode(items)
+	case "revoke":
+		if !safeID(*id) {
+			return errors.New("submitter revoke requires a valid --id")
+		}
+		if err := svc.Revoke(ctx, *id); err != nil {
+			return err
+		}
+		return encode(map[string]any{"submitter_id": *id, "status": "revoked"})
+	case "rotate":
+		if !safeID(*id) {
+			return errors.New("submitter rotate requires a valid --id")
+		}
+		a, err := svc.Rotate(ctx, *id)
+		if err != nil {
+			return err
+		}
+		return encode(map[string]any{"submitter_id": *id, "submission_address": a})
+	default:
+		return fmt.Errorf("unknown submitter command %q", args[0])
 	}
 }
 

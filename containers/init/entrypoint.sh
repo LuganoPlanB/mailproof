@@ -10,7 +10,13 @@ printf '%s OK\n' "${MAILPROOF_VERIFY_RECIPIENT:?MAILPROOF_VERIFY_RECIPIENT is re
 if [[ ! -s ${runtime}/secrets/report-signing-key.pem ]]; then
 	openssl genpkey -algorithm ED25519 -out "${runtime}/secrets/report-signing-key.pem"
 fi
-chmod 0600 -- "${runtime}/secrets/submitters.json" "${runtime}/secrets/postfix-recipient-access" "${runtime}/secrets/report-signing-key.pem"
+if [[ ! -s ${runtime}/secrets/capability-hmac-key ]]; then
+	openssl rand -out "${runtime}/secrets/capability-hmac-key" 32
+fi
+if [[ ! -s ${runtime}/secrets/admission-stamp-hmac-key ]]; then
+	openssl rand -out "${runtime}/secrets/admission-stamp-hmac-key" 32
+fi
+chmod 0600 -- "${runtime}/secrets/submitters.json" "${runtime}/secrets/postfix-recipient-access" "${runtime}/secrets/report-signing-key.pem" "${runtime}/secrets/capability-hmac-key" "${runtime}/secrets/admission-stamp-hmac-key"
 printf '%s\n' "${MAILPROOF_REPORT_RECIPIENT:?MAILPROOF_REPORT_RECIPIENT is required}" >"${runtime}/config/report-recipient"
 chmod 0600 -- "${runtime}/config/report-recipient"
 printf '%s\n' "${MAILPROOF_CLAMAV_PROVISION:-none}" >"${runtime}/config/clamav-provision-mode"

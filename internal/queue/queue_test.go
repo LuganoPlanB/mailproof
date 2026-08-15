@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sync"
 	"testing"
@@ -169,11 +170,38 @@ func TestMigrationRecordsVersion(t *testing.T) {
 	}
 	defer db.Close()
 	var version int
-	if err := db.QueryRow(`SELECT version FROM schema_migrations`).Scan(&version); err != nil {
+	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 1 {
+	if version != 2 {
 		t.Fatalf("version=%d", version)
+	}
+}
+
+func TestMigrationFromVersionOnePreservesQueueRows(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+INSERT INTO schema_migrations VALUES(1,1);
+CREATE TABLE deliveries(delivery_id TEXT PRIMARY KEY,message_digest TEXT NOT NULL,source_key TEXT NOT NULL UNIQUE,collected_at INTEGER NOT NULL);
+CREATE TABLE runs(run_id TEXT PRIMARY KEY,delivery_id TEXT NOT NULL,state TEXT NOT NULL,analysis_attempts INTEGER NOT NULL DEFAULT 0,report_attempts INTEGER NOT NULL DEFAULT 0,not_before INTEGER NOT NULL DEFAULT 0,lease_owner TEXT,lease_until INTEGER,last_error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL);
+CREATE TABLE collector_lease(singleton INTEGER PRIMARY KEY,owner TEXT NOT NULL,until INTEGER NOT NULL);
+INSERT INTO deliveries VALUES('delivery','digest','source',1);
+INSERT INTO runs(run_id,delivery_id,state,created_at) VALUES('run','delivery','queued',1);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	if err := db.QueryRow("SELECT COUNT(*) FROM deliveries WHERE delivery_id='delivery'").Scan(&rows); err != nil || rows != 1 {
+		t.Fatalf("preserved deliveries=%d err=%v", rows, err)
+	}
+	if err := Migrate(context.Background(), db); err != nil {
+		t.Fatalf("idempotent migration: %v", err)
 	}
 }
 
