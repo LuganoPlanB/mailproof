@@ -17,6 +17,7 @@ Accepted for the v1 Compose spine.
 | YARA, deep archive, PDF, LNK, QR and English semantic rules | required | `analysis-adapters-supplementary`, `semantic-analysis` |
 | S/MIME and OpenPGP with mounted operator trust material | configured | `analysis-adapters-crypto` |
 | Licensed threat-feed adapters | configured | `analysis-adapters-threat-feeds` |
+| Narrow local SMTP admission policy service | required by ADR 0004 | `admission-policy` |
 | SMTP-time Rspamd milter actions, IMAP/WebUI, provider LLM | deferred | none in v1 |
 | Independent DKIM/ARC, statistical learning, multi-host queues, object storage | deferred | none in v1 |
 | General-purpose Rspamd-to-Go callback plugin | deferred | none in v1 |
@@ -27,5 +28,7 @@ evidence and retain that provenance. S/MIME/OpenPGP without mounted trust
 material and unconfigured feeds report `UNAVAILABLE`; they do not silently pass.
 
 No later milestone may implement a deferred capability without an explicit v2
-decision. The table has one owner per capability and makes required,
+decision. ADR 0004 is the sole v2 exception for the narrow local admission
+policy service; it does not enable a Rspamd milter or arbitrary callback plugin.
+The table has one owner per capability and makes required,
 configured, and deferred behavior reviewable.
