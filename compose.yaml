@@ -41,6 +41,7 @@ services:
     depends_on:
       init: {condition: service_completed_successfully}
       dovecot: {condition: service_healthy}
+      admission: {condition: service_started}
     ports: ["${MAILPROOF_SMTP_PORT:-2525}:25"]
     networks: [public, mail, report]
     volumes:
@@ -51,6 +52,26 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/25"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    logging: *logging
+
+  # The only SMTP-time application component. It is confined to the mail
+  # network and has neither delivered mail nor analyzer/scanner access.
+  admission:
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-app"
+    command: ["admission"]
+    depends_on: {init: {condition: service_completed_successfully}}
+    networks: [mail]
+    volumes:
+      - state:/state
+      - runtime:/runtime:ro
+    <<: [*hardening, *resources]
+    tmpfs: [/tmp]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /state/mailproof.sqlite"]
       interval: 5s
       timeout: 3s
       retries: 12

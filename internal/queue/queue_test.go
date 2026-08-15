@@ -173,8 +173,30 @@ func TestMigrationRecordsVersion(t *testing.T) {
 	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 2 {
+	if version != 4 {
 		t.Fatalf("version=%d", version)
+	}
+}
+
+func TestRecordRejectedCollectionEnqueuesNotarization(t *testing.T) {
+	db, err := Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Unix(1700000000, 0).UTC()
+	if err := RecordRejectedCollection(context.Background(), db, "delivery", "digest", "source", "decision", "stamp_invalid", now); err != nil {
+		t.Fatal(err)
+	}
+	var deliveries, work int
+	if err := db.QueryRow("SELECT COUNT(*) FROM deliveries").Scan(&deliveries); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM rejection_work_items WHERE kind='notarize' AND state='pending'").Scan(&work); err != nil {
+		t.Fatal(err)
+	}
+	if deliveries != 1 || work != 1 {
+		t.Fatalf("deliveries=%d work=%d", deliveries, work)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/smtp"
 	"os"
 	"os/signal"
@@ -18,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/luganoplanb/mailproof/internal/admission"
 	"github.com/luganoplanb/mailproof/internal/analyzers"
 	"github.com/luganoplanb/mailproof/internal/artifact"
 	"github.com/luganoplanb/mailproof/internal/budget"
@@ -49,7 +51,7 @@ func exitCode(err error) int {
 }
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: mailproof {version|collect|worker|reporter|status|inspect|replay|bundle|verify-report|redeliver|submitter}")
+		return errors.New("usage: mailproof {version|collect|worker|reporter|status|inspect|replay|bundle|verify-report|redeliver|submitter|admission}")
 	}
 	switch args[0] {
 	case "version":
@@ -74,9 +76,42 @@ func run(ctx context.Context, args []string) error {
 		return redeliver(ctx, args[1:])
 	case "submitter":
 		return submitterCommand(ctx, args[1:])
+	case "admission":
+		return admissionCommand(ctx, args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func admissionCommand(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("admission", flag.ContinueOnError)
+	state := fs.String("state", "/state/mailproof.sqlite", "SQLite state database")
+	capabilityKey := fs.String("capability-key", "/runtime/secrets/capability-hmac-key", "capability HMAC key")
+	stampKey := fs.String("stamp-key", "/runtime/secrets/admission-stamp-hmac-key", "admission stamp HMAC key")
+	domain := fs.String("domain", "mailproof.test", "submission address domain")
+	listen := fs.String("listen", ":10040", "Postfix policy listener")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cap, err := os.ReadFile(*capabilityKey)
+	if err != nil {
+		return fmt.Errorf("read capability HMAC key: %w", err)
+	}
+	stamp, err := os.ReadFile(*stampKey)
+	if err != nil {
+		return fmt.Errorf("read admission stamp HMAC key: %w", err)
+	}
+	db, err := queue.Open(ctx, *state)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	listener, err := net.Listen("tcp", *listen)
+	if err != nil {
+		return fmt.Errorf("listen admission policy: %w", err)
+	}
+	defer listener.Close()
+	return (admission.Server{Service: admission.Service{DB: db, CapabilityKey: cap, StampKey: stamp, Domain: *domain, Resolver: admission.DNSResolver{Server: "unbound:53", Timeout: 2 * time.Second}}, MaxConnections: 32}).Serve(ctx, listener)
 }
 
 // postfixMailer is the concrete adapter; enrollment itself only knows Mailer.
@@ -308,6 +343,8 @@ func collect(ctx context.Context, args []string) error {
 	state := fs.String("state", "/state/mailproof.sqlite", "SQLite state database")
 	logs := fs.String("postfix-log", "", "restricted Postfix log file")
 	registry := fs.String("token-registry", "", "token registry JSON file")
+	stampKeyPath := fs.String("admission-stamp-key", "/runtime/secrets/admission-stamp-hmac-key", "admission stamp HMAC key")
+	subjectAllowlistPath := fs.String("subject-domain-allowlist", "", "newline-delimited selected subject domain allowlist")
 	once := fs.Bool("once", false, "run one sweep")
 	watch := fs.Bool("watch", false, "poll every two seconds")
 	maxJobs := fs.Int("max-jobs", 0, "maximum collection sweeps")
@@ -341,6 +378,10 @@ func collect(ctx context.Context, args []string) error {
 		return err
 	}
 	defer db.Close()
+	subjectAllowlist, err := readAllowlist(*subjectAllowlistPath)
+	if err != nil {
+		return err
+	}
 	ok, err := queue.AcquireCollectorLease(ctx, db, owner, time.Now(), 30*time.Second)
 	if err != nil {
 		return err
@@ -358,7 +399,7 @@ func collect(ctx context.Context, args []string) error {
 		if !ok {
 			return errors.New("collector lease lost")
 		}
-		if err := collectOnce(ctx, db, *source, *artifacts, *logs, *registry); err != nil {
+		if err := collectOnce(ctx, db, *source, *artifacts, *logs, *registry, *stampKeyPath, subjectAllowlist); err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return emitStatus("collect", "stopped", sweeps)
 			}
@@ -378,7 +419,7 @@ func collect(ctx context.Context, args []string) error {
 		}
 	}
 }
-func collectOnce(ctx context.Context, db *sql.DB, source, artifacts, logPath, registryPath string) error {
+func collectOnce(ctx context.Context, db *sql.DB, source, artifacts, logPath, registryPath, stampKeyPath string, subjectAllowlist []string) error {
 	entries, err := os.ReadDir(source)
 	if err != nil {
 		return fmt.Errorf("read Maildir: %w", err)
@@ -411,6 +452,76 @@ func collectOnce(ctx context.Context, db *sql.DB, source, artifacts, logPath, re
 		if err := publishIngress(artifacts, deliveryID, digest, entry.Name(), correlation); err != nil {
 			return err
 		}
+		stampKey, keyErr := os.ReadFile(stampKeyPath)
+		if keyErr != nil {
+			return fmt.Errorf("read admission stamp HMAC key: %w", keyErr)
+		}
+		admissionContext := admission.Service{DB: db, StampKey: stampKey}
+		decision, admissionErr := admissionContext.ConsumeStamp(ctx, headerPrefix(message), correlation.QueueID)
+		if admissionErr != nil {
+			decisionID, idErr := randomID()
+			if idErr != nil {
+				return idErr
+			}
+			if err := queue.RecordRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, "admission_stamp_invalid", time.Now()); err != nil {
+				return err
+			}
+			continue
+		}
+		wrapperFrom, wrapperErr := admission.SelectedSubjectFrom(message)
+		if wrapperErr != nil || wrapperFrom != decision.Envelope {
+			decisionID, idErr := randomID()
+			if idErr != nil {
+				return idErr
+			}
+			if err := queue.RecordRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, "wrapper_sender_invalid", time.Now()); err != nil {
+				return err
+			}
+			if err := queue.EnqueueVerifiedRejectionNotification(ctx, db, decision.ID, deliveryID, decisionID+"-notify", time.Now()); err != nil {
+				return err
+			}
+			continue
+		}
+		sealed, readErr := os.ReadFile(filepath.Join(artifacts, "messages", digest+".eml"))
+		if readErr != nil {
+			return fmt.Errorf("read sealed delivery: %w", readErr)
+		}
+		selection, selectionErr := evidence.SelectTopLevelRFC822(sealed, digest, artifacts)
+		if selectionErr != nil {
+			return fmt.Errorf("select subject: %w", selectionErr)
+		}
+		if selection.SubjectDigest == "" && selection.SelectionError == "" {
+			selection.SubjectDigest = digest
+		}
+		if selection.SelectionError != "" {
+			decisionID, idErr := randomID()
+			if idErr != nil {
+				return idErr
+			}
+			if err := queue.RecordRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, "selected_subject_ambiguous", time.Now()); err != nil {
+				return err
+			}
+			continue
+		}
+		selected, readErr := os.ReadFile(filepath.Join(artifacts, "messages", selection.SubjectDigest+".eml"))
+		if readErr != nil {
+			return fmt.Errorf("read sealed selected subject: %w", readErr)
+		}
+		selectedFrom, selectedErr := admission.SelectedSubjectFrom(selected)
+		_, allowed := admission.SelectedSubjectAllowed(selectedFrom, subjectAllowlist)
+		if selectedErr != nil || !allowed {
+			decisionID, idErr := randomID()
+			if idErr != nil {
+				return idErr
+			}
+			if err := queue.RecordRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, "selected_subject_sender_denied", time.Now()); err != nil {
+				return err
+			}
+			if err := queue.EnqueueVerifiedRejectionNotification(ctx, db, decision.ID, deliveryID, decisionID+"-notify", time.Now()); err != nil {
+				return err
+			}
+			continue
+		}
 		runID, err := randomID()
 		if err != nil {
 			return err
@@ -420,6 +531,34 @@ func collectOnce(ctx context.Context, db *sql.DB, source, artifacts, logPath, re
 		}
 	}
 	return nil
+}
+
+func readAllowlist(path string) ([]string, error) {
+	if path == "" {
+		return []string{}, nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read selected subject allowlist: %w", err)
+	}
+	values := []string{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
+			values = append(values, line)
+		}
+	}
+	return values, nil
+}
+
+func headerPrefix(message []byte) []string {
+	lines := []string{}
+	for _, line := range strings.Split(string(message), "\n") {
+		if line == "\r" || line == "" {
+			break
+		}
+		lines = append(lines, line)
+	}
+	return lines
 }
 
 func readLines(path string) []string {
