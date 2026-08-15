@@ -22,6 +22,18 @@ func TestStatusRequiresJSON(t *testing.T) {
 		t.Fatal("status accepted missing --json")
 	}
 }
+
+func TestSubmitterDryRunDoesNotRequireStateOrSecrets(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "missing.sqlite")
+	key := filepath.Join(dir, "missing-key")
+	if err := run(context.Background(), []string{"submitter", "challenge", "--email", "operator@example.org", "--state", state, "--capability-key", key, "--dry-run", "--json"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(state); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dry-run created state: %v", err)
+	}
+}
 func TestCollectRejectsConflictingModes(t *testing.T) {
 	if err := run(context.Background(), []string{"collect", "--once", "--watch"}); err == nil {
 		t.Fatal("collect accepted conflicting modes")

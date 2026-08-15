@@ -1,7 +1,8 @@
 # Backup, restore, retention, and upgrades
 
 Authoritative state is the Maildir, immutable artifact tree, SQLite database and
-WAL, restricted Postfix ingress log, runtime token registry, signing keys, and
+WAL, restricted Postfix ingress log, runtime token registry, submitter rows,
+capability and admission-stamp HMAC keys, signing keys, and
 committed configuration. Redis and Unbound are disposable caches and are never
 backed up. Treat every backup as secret material: it contains recipient
 correlation and private keys.
@@ -37,3 +38,21 @@ from a volume. Rotate a signing key only after publishing its public key and
 keeping prior verification keys. Rotate recipient tokens and feeds by staged
 configuration update and smoke verification. Schema migrations are forward-only:
 the rollback procedure is restore of the pre-migration backup, not a downgrade.
+
+## Submitter enrollment and recovery
+
+Start with `mailproof submitter challenge --email ADDRESS --dry-run --json`,
+then repeat with `--confirm`; confirmation sends a 15-minute, single-use code
+through internal Postfix. Activate it with `mailproof submitter activate --email
+ADDRESS --code CODE --confirm --json`. The submission address appears exactly
+once, so store it in the approved secret store rather than a ticket or shell
+history. Use `submitter list --json` and `submitter revoke --id ID --confirm
+--json` for safe operator views and revocation. For an exposed or lost address,
+run the rotate dry-run then `submitter rotate --id ID --confirm --json`; the old
+address immediately stops working. Never edit SQLite or runtime JSON manually.
+
+`/runtime/secrets` is an authoritative backup input and contains distinct
+`capability-hmac-key` and `admission-stamp-hmac-key` files. Back them up only
+through `scripts/backup.sh`. If a key is lost, restore it from the verified
+backup before startup. If the capability key cannot be recovered, revoke and
+re-enroll affected submitters: keyed digests cannot be recovered or re-keyed.

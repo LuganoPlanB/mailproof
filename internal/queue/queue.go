@@ -76,7 +76,8 @@ func Open(ctx context.Context, path string) (*sql.DB, error) {
 }
 
 func Migrate(ctx context.Context, db *sql.DB) error {
-	_, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS deliveries (
+	_, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS deliveries (
  delivery_id TEXT PRIMARY KEY, message_digest TEXT NOT NULL, source_key TEXT NOT NULL UNIQUE, collected_at INTEGER NOT NULL,
  UNIQUE(delivery_id));
  CREATE TABLE IF NOT EXISTS runs (
@@ -87,11 +88,54 @@ func Migrate(ctx context.Context, db *sql.DB) error {
  created_at INTEGER NOT NULL, UNIQUE(delivery_id, run_id));
 
  CREATE INDEX IF NOT EXISTS runs_claim ON runs(state, not_before, lease_until);
- CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS collector_lease (singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner TEXT NOT NULL, until INTEGER NOT NULL);
  INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, unixepoch());`)
 	if err != nil {
 		return fmt.Errorf("migrate queue database: %w", err)
+	}
+	migrations := []struct {
+		version int
+		sql     string
+	}{{2, `CREATE TABLE submitters (
+ submitter_id TEXT PRIMARY KEY, canonical_address TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','active','revoked')),
+ created_at INTEGER NOT NULL, verified_at INTEGER, revoked_at INTEGER, policy_version TEXT NOT NULL,
+ minute_limit INTEGER NOT NULL, hour_limit INTEGER NOT NULL, day_limit INTEGER NOT NULL,
+ UNIQUE(canonical_address, status));
+ CREATE UNIQUE INDEX submitters_one_active_address ON submitters(canonical_address) WHERE status='active';
+ CREATE TABLE submitter_challenges (
+ challenge_id TEXT PRIMARY KEY, submitter_id TEXT NOT NULL REFERENCES submitters(submitter_id), code_digest BLOB NOT NULL,
+ created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, consumed_at INTEGER,
+ UNIQUE(submitter_id, code_digest));
+ CREATE INDEX submitter_challenges_active ON submitter_challenges(submitter_id, expires_at) WHERE consumed_at IS NULL;
+ CREATE TABLE submission_capabilities (
+ capability_id TEXT PRIMARY KEY, submitter_id TEXT NOT NULL REFERENCES submitters(submitter_id), digest BLOB NOT NULL,
+ key_id TEXT NOT NULL, activated_at INTEGER NOT NULL, revoked_at INTEGER,
+ UNIQUE(key_id, digest));
+
+ CREATE UNIQUE INDEX submission_capabilities_one_active ON submission_capabilities(submitter_id) WHERE revoked_at IS NULL;`}}
+	for _, migration := range migrations {
+		version := migration.version
+		var exists int
+		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM schema_migrations WHERE version=?", version).Scan(&exists); err != nil {
+			return fmt.Errorf("read schema migration %d: %w", version, err)
+		}
+		if exists != 0 {
+			continue
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin schema migration %d: %w", version, err)
+		}
+		if _, err = tx.ExecContext(ctx, migration.sql); err == nil {
+			_, err = tx.ExecContext(ctx, "INSERT INTO schema_migrations(version,applied_at) VALUES(?,unixepoch())", version)
+		}
+		if err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("apply schema migration %d: %w", version, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit schema migration %d: %w", version, err)
+		}
 	}
 	return nil
 }
