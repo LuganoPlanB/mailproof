@@ -48,6 +48,11 @@
   [ "$status" -eq 0 ]
 }
 
+@test "CI stops the singleton collector before a one-shot sweep" {
+  run python3 -c 'from pathlib import Path; workflow=Path(".github/workflows/quality.yml").read_text(); assert workflow.index("docker compose stop collector") < workflow.index("docker compose run --rm --no-deps collector collect --once"); assert "docker compose run --rm --no-deps worker worker --drain" in workflow'
+  [ "$status" -eq 0 ]
+}
+
 @test "backup and restore runbooks expose dry-run-first commands" {
   run scripts/backup.sh --dry-run --output /tmp/mailproof-backup
   [ "$status" -eq 0 ]

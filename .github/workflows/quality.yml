@@ -40,8 +40,9 @@ jobs:
           bash scripts/smoke.sh --confirm
       - name: Exercise collection and durable worker drain
         run: |
-          docker compose run --rm collector collect --once
-          docker compose run --rm worker worker --drain
+          docker compose stop collector
+          docker compose run --rm --no-deps collector collect --once
+          docker compose run --rm --no-deps worker worker --drain
       - name: Collect diagnostics and stop services
         if: always()
         run: |

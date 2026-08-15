@@ -27,6 +27,10 @@ before changing this path or the meaning of evidence.
   collapse duplicate message bytes into one delivery or overwrite an old run.
 - Queue work uses SQLite leases. Replays create new runs, unknown replies are
   quarantined, and schema migrations are forward-only.
+- The collector is a singleton. Stop the continuous Compose collector before a
+  scheduled `collect --once` run; competing collectors deliberately exit 3.
+  Use `compose run --no-deps` for maintenance probes against an already-started
+  graph so Compose does not rerun `init` or re-evaluate unrelated dependencies.
 - Reporter signing material is confined to the read-only runtime volume and the
   report network. Keep analyzer, scanner, mail, report, and public network
   boundaries intact.
