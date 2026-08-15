@@ -174,7 +174,7 @@ func TestMigrationRecordsVersion(t *testing.T) {
 	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 7 {
+	if version != 8 {
 		t.Fatalf("version=%d", version)
 	}
 }
@@ -277,6 +277,10 @@ func TestRecordRejectedCollectionEnqueuesNotarization(t *testing.T) {
 	}
 	if deliveries != 1 || work != 1 {
 		t.Fatalf("deliveries=%d work=%d", deliveries, work)
+	}
+	var events int
+	if err := db.QueryRow("SELECT COUNT(*) FROM analytics_events WHERE producer='reporter' AND event_type='rejection_delivery_state'").Scan(&events); err != nil || events != 1 {
+		t.Fatalf("signing events=%d err=%v", events, err)
 	}
 }
 

@@ -23,6 +23,111 @@ func TestStatusRequiresJSON(t *testing.T) {
 	}
 }
 
+func TestAnalyticsCommandsRequireExplicitModeAndRetentionBackup(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "analytics.sqlite")
+	if err := run(context.Background(), []string{"analytics", "rebuild", "--state", state, "--dry-run"}); err != nil {
+		t.Fatalf("rebuild dry-run: %v", err)
+	}
+	if err := run(context.Background(), []string{"analytics", "retain", "--state", state, "--dry-run"}); err == nil {
+		t.Fatal("retain dry-run accepted absent backup marker")
+	}
+	db, err := queue.Open(context.Background(), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if err := run(context.Background(), []string{"analytics", "retain", "--state", state, "--confirm"}); err == nil {
+		t.Fatal("retain accepted absent backup marker")
+	}
+	if err := run(context.Background(), []string{"analytics", "rebuild", "--state", state, "--confirm"}); err != nil {
+		t.Fatalf("rebuild confirm: %v", err)
+	}
+}
+
+func TestAnalyticsProjectorLeaseExclusionAndShutdown(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "analytics.sqlite")
+	db, err := queue.Open(context.Background(), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ok, err := acquireAnalyticsLease(context.Background(), db, "one", time.Now(), time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("first lease=%v,%v", ok, err)
+	}
+	if ok, err = acquireAnalyticsLease(context.Background(), db, "two", time.Now(), time.Minute); err != nil || ok {
+		t.Fatalf("second lease=%v,%v", ok, err)
+	}
+	releaseAnalyticsLease(context.Background(), db, "one")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := run(ctx, []string{"analytics-projector", "--state", state, "--watch", "--poll-interval=1ms"}); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("graceful shutdown: %v", err)
+	}
+}
+
+func TestAnalyticsRebuildAndRetentionContracts(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "analytics.sqlite")
+	db, err := queue.Open(context.Background(), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := db.Exec(`INSERT INTO analytics_events(producer,source_type,source_id,event_type,schema_version,occurred_at,outcome,duration_ms,payload_digest) VALUES('queue','run','old','run_started',1,?,'analysis',0,'digest'); UPDATE analytics_cursor SET event_id=1 WHERE singleton=1; INSERT INTO analytics_backup_markers(marker_id,verified_at,manifest_digest) VALUES(1,?,'digest')`, now.AddDate(0, 0, -32).Unix(), now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	// A dry run never mutates append-only input.
+	if err := run(context.Background(), []string{"analytics", "retain", "--state", state, "--dry-run"}); err != nil {
+		t.Fatal(err)
+	}
+	var before int
+	if err := db.QueryRow("SELECT COUNT(*) FROM analytics_events").Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), []string{"analytics", "rebuild", "--state", state, "--confirm"}); err != nil {
+		t.Fatal(err)
+	}
+	var incremental string
+	if err := db.QueryRow("SELECT group_concat(granularity||':'||bucket_start||':'||event_count) FROM metric_rollups").Scan(&incremental); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), []string{"analytics", "rebuild", "--state", state, "--dry-run"}); err != nil {
+		t.Fatal(err)
+	}
+	var afterDry string
+	if err := db.QueryRow("SELECT group_concat(granularity||':'||bucket_start||':'||event_count) FROM metric_rollups").Scan(&afterDry); err != nil {
+		t.Fatal(err)
+	}
+	if incremental != afterDry {
+		t.Fatal("rebuild dry-run mutated rollups")
+	}
+	// Supply complete coarser buckets, then retention may compact only analytics input.
+	if _, err := db.Exec(`INSERT OR IGNORE INTO metric_rollups VALUES(0,'minute','run_started','analysis',1,'{}',1,1),(0,'hour','run_started','analysis',1,'{}',1,1),(0,'day','run_started','analysis',1,'{}',1,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), []string{"analytics", "retain", "--state", state, "--confirm"}); err != nil {
+		t.Fatal(err)
+	}
+	var remaining int
+	if err := db.QueryRow("SELECT COUNT(*) FROM analytics_events").Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if before != 1 || remaining != 0 {
+		t.Fatalf("retention events before/after=%d/%d", before, remaining)
+	}
+	db.Close()
+}
+
+func TestAnalyticsRebuildRequiresStrictHalfOpenUTCWindow(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "analytics.sqlite")
+	for _, args := range [][]string{{"analytics", "rebuild", "--state", state, "--dry-run", "--from=2024-01-01T00:00:00+01:00", "--to=2024-01-02T00:00:00Z"}, {"analytics", "rebuild", "--state", state, "--dry-run", "--from=2024-01-02T00:00:00Z", "--to=2024-01-01T00:00:00Z"}, {"analytics", "rebuild", "--state", state, "--dry-run", "--from=2024-01-01T10:00:00Z", "--to=2024-01-01T11:00:00Z"}} {
+		if err := run(context.Background(), args); err == nil {
+			t.Fatal("invalid rebuild window accepted")
+		}
+	}
+}
+
 func TestSubmitterDryRunDoesNotRequireStateOrSecrets(t *testing.T) {
 	dir := t.TempDir()
 	state := filepath.Join(dir, "missing.sqlite")

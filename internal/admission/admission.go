@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/luganoplanb/mailproof/internal/analytics"
+
 	"github.com/luganoplanb/mailproof/internal/submitter"
 )
 
@@ -245,7 +247,14 @@ func (s Service) store(ctx context.Context, tx *sql.Tx, d Decision, r Request, d
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO decision_signing_outbox(decision_id,state,created_at) VALUES(?,'pending',?) ON CONFLICT(decision_id) DO NOTHING`, d.ID, now.Unix())
-	return err
+	if err != nil {
+		return err
+	}
+	e, err := analytics.NewLifecycle("admission", "decision", d.ID, "admission_decision", decisionOutcome(d.Reason), now)
+	if err != nil {
+		return err
+	}
+	return analytics.InsertTx(ctx, tx, e)
 }
 func decisionOutcome(reason string) string {
 	if reason == "admitted" {

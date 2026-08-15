@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/luganoplanb/mailproof/internal/analytics"
 	_ "modernc.org/sqlite"
 )
 
@@ -72,6 +73,9 @@ func enqueueCollection(ctx context.Context, db *sql.DB, deliveryID, digest, sour
 	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(run_id,delivery_id,state,created_at) VALUES(?,?,?,?) ON CONFLICT(run_id) DO NOTHING`, runID, deliveryID, Queued, now.Unix()); err != nil {
 		return fmt.Errorf("insert run: %w", err)
 	}
+	if err := eventTx(ctx, tx, "collector", "delivery", deliveryID, "subject_preflight", "accepted", now); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit collection: %w", err)
 	}
@@ -115,13 +119,24 @@ func ReportDestinationForRun(ctx context.Context, db *sql.DB, runID string) (Rep
 // connection is made. Capability material is intentionally not part of this
 // lifecycle record.
 func BeginReportAttempt(ctx context.Context, db *sql.DB, runID string, destination ReportDestination, now time.Time) (int64, error) {
-	result, err := db.ExecContext(ctx, `INSERT INTO report_delivery_attempts(run_id,submitter_id,reply_address,started_at,outcome,error_class) VALUES(?,?,?,?,?,?)`, runID, destination.SubmitterID, destination.ReplyAddress, now.Unix(), "started", "")
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `INSERT INTO report_delivery_attempts(run_id,submitter_id,reply_address,started_at,outcome,error_class) VALUES(?,?,?,?,?,?)`, runID, destination.SubmitterID, destination.ReplyAddress, now.Unix(), "started", "")
 	if err != nil {
 		return 0, fmt.Errorf("begin report delivery attempt: %w", err)
 	}
 	id, err := result.LastInsertId()
 	if err != nil {
 		return 0, fmt.Errorf("report delivery attempt ID: %w", err)
+	}
+	if err := eventTx(ctx, tx, "reporter", "run", fmt.Sprintf("%s:attempt:%d:started", runID, id), "report_delivery_state", "started", now); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
 	}
 	return id, nil
 }
@@ -133,7 +148,12 @@ func FinishReportAttempt(ctx context.Context, db *sql.DB, attemptID int64, outco
 	if errorClass != "" && errorClass != "smtp" {
 		return errors.New("invalid report delivery error class")
 	}
-	result, err := db.ExecContext(ctx, `UPDATE report_delivery_attempts SET finished_at=?,outcome=?,error_class=? WHERE attempt_id=? AND outcome='started'`, finished.Unix(), outcome, errorClass, attemptID)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE report_delivery_attempts SET finished_at=?,outcome=?,error_class=? WHERE attempt_id=? AND outcome='started'`, finished.Unix(), outcome, errorClass, attemptID)
 	if err != nil {
 		return fmt.Errorf("finish report delivery attempt: %w", err)
 	}
@@ -144,7 +164,14 @@ func FinishReportAttempt(ctx context.Context, db *sql.DB, attemptID int64, outco
 	if n != 1 {
 		return errors.New("report delivery attempt not active")
 	}
-	return nil
+	var runID string
+	if err := tx.QueryRowContext(ctx, "SELECT run_id FROM report_delivery_attempts WHERE attempt_id=?", attemptID).Scan(&runID); err != nil {
+		return err
+	}
+	if err := eventTx(ctx, tx, "reporter", "run", fmt.Sprintf("%s:attempt:%d:%s", runID, attemptID, outcome), "report_delivery_state", outcome, finished); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // RecordRejectedCollection preserves the sealed delivery and its auditable
@@ -198,6 +225,12 @@ func recordRejectedCollection(ctx context.Context, db *sql.DB, deliveryID, diges
 	if _, err := tx.ExecContext(ctx, `INSERT INTO decision_signing_outbox(decision_id,state,created_at) VALUES(?,'pending',?) ON CONFLICT(decision_id) DO NOTHING`, decisionID, now.Unix()); err != nil {
 		return fmt.Errorf("enqueue decision signing: %w", err)
 	}
+	if err := eventTx(ctx, tx, "collector", "delivery", deliveryID, "subject_preflight", reason, now); err != nil {
+		return err
+	}
+	if err := eventTx(ctx, tx, "reporter", "decision", decisionID+":signing", "rejection_delivery_state", "pending", now); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit rejected collection: %w", err)
 	}
@@ -207,11 +240,19 @@ func recordRejectedCollection(ctx context.Context, db *sql.DB, deliveryID, diges
 // EnqueueVerifiedRejectionNotification makes a reply eligible only when the
 // consumed admission decision already identifies a verified submitter.
 func EnqueueVerifiedRejectionNotification(ctx context.Context, db *sql.DB, decisionID, deliveryID, workID string, now time.Time) error {
-	_, err := db.ExecContext(ctx, `INSERT INTO rejection_work_items(work_id,decision_id,delivery_id,kind,created_at) VALUES(?,?,?,'notify_verified_forwarder',?)`, workID, decisionID, deliveryID, now.Unix())
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `INSERT INTO rejection_work_items(work_id,decision_id,delivery_id,kind,created_at) VALUES(?,?,?,'notify_verified_forwarder',?)`, workID, decisionID, deliveryID, now.Unix())
 	if err != nil {
 		return fmt.Errorf("enqueue verified rejection notification: %w", err)
 	}
-	return nil
+	if err := eventTx(ctx, tx, "reporter", "decision", workID, "rejection_delivery_state", "pending", now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func Collected(ctx context.Context, db *sql.DB, sourceKey string) (bool, error) {
@@ -344,7 +385,16 @@ CREATE TABLE decision_signing_outbox (
  attempts INTEGER NOT NULL DEFAULT 0, not_before INTEGER NOT NULL DEFAULT 0, lease_owner TEXT, lease_until INTEGER,
  last_error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL
 );
-CREATE INDEX decision_signing_outbox_claim ON decision_signing_outbox(state, not_before, lease_until);`}}
+CREATE INDEX decision_signing_outbox_claim ON decision_signing_outbox(state, not_before, lease_until);`}, {8, `CREATE TABLE analytics_events (
+ event_id INTEGER PRIMARY KEY, producer TEXT NOT NULL, source_type TEXT NOT NULL, source_id TEXT NOT NULL, event_type TEXT NOT NULL,
+ schema_version INTEGER NOT NULL, occurred_at INTEGER NOT NULL, outcome TEXT NOT NULL, dimension_key TEXT NOT NULL DEFAULT '{}', duration_ms INTEGER NOT NULL DEFAULT 0 CHECK(duration_ms>=0), payload_digest TEXT NOT NULL,
+ UNIQUE(producer,source_type,source_id,event_type,schema_version));
+CREATE INDEX analytics_events_project ON analytics_events(event_id);
+CREATE TABLE analytics_cursor (singleton INTEGER PRIMARY KEY CHECK(singleton=1), event_id INTEGER NOT NULL DEFAULT 0);
+INSERT INTO analytics_cursor(singleton,event_id) VALUES(1,0);
+CREATE TABLE metric_rollups (bucket_start INTEGER NOT NULL, granularity TEXT NOT NULL CHECK(granularity IN ('minute','hour','day')), metric TEXT NOT NULL, outcome TEXT NOT NULL, schema_version INTEGER NOT NULL, dimension_key TEXT NOT NULL DEFAULT '{}', event_count INTEGER NOT NULL, source_high_watermark INTEGER NOT NULL, PRIMARY KEY(bucket_start,granularity,metric,outcome,schema_version,dimension_key));
+CREATE TABLE analytics_projector_lease (singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner TEXT NOT NULL, until INTEGER NOT NULL);
+CREATE TABLE analytics_backup_markers (marker_id INTEGER PRIMARY KEY CHECK(marker_id=1), verified_at INTEGER NOT NULL, manifest_digest TEXT NOT NULL);`}}
 	for _, migration := range migrations {
 		version := migration.version
 		var exists int
@@ -439,6 +489,9 @@ func Claim(ctx context.Context, db *sql.DB, owner, phase string, now time.Time, 
 	if n != 1 {
 		return nil, nil
 	}
+	if err := eventTx(ctx, tx, "queue", "run", run.ID, "run_started", phase, now); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit claim: %w", err)
 	}
@@ -446,18 +499,48 @@ func Claim(ctx context.Context, db *sql.DB, owner, phase string, now time.Time, 
 }
 
 func FinishAnalysis(ctx context.Context, db *sql.DB, id, owner string) error {
-	result, err := db.ExecContext(ctx, `UPDATE runs SET state='report_pending', lease_owner=NULL, lease_until=NULL WHERE run_id=? AND state='analysis_leased' AND lease_owner=?`, id, owner)
+	return FinishAnalysisMeasured(ctx, db, id, owner, 0)
+}
+func FinishAnalysisMeasured(ctx context.Context, db *sql.DB, id, owner string, duration time.Duration) error {
+	return transitionMeasured(ctx, db, id, owner, "analysis_leased", ReportPending, "worker", duration)
+}
+func transition(ctx context.Context, db *sql.DB, id, owner, from, to, producer string) error {
+	return transitionMeasured(ctx, db, id, owner, from, to, producer, 0)
+}
+func transitionMeasured(ctx context.Context, db *sql.DB, id, owner, from, to, producer string, duration time.Duration) error {
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("finish analysis: %w", err)
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET state=?, lease_owner=NULL, lease_until=NULL WHERE run_id=? AND state=? AND lease_owner=?`, to, id, from, owner)
+	if err != nil {
+		return fmt.Errorf("transition run: %w", err)
 	}
 	n, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("finish analysis rows: %w", err)
+		return fmt.Errorf("transition rows: %w", err)
 	}
 	if n != 1 {
-		return errors.New("analysis lease not owned")
+		return errors.New("run lease not owned")
 	}
-	return nil
+	eventType := ""
+	if producer == "reporter" {
+		eventType = "report_delivery_state"
+	} else if producer == "worker" {
+		eventType = "run_completed"
+	}
+	if eventType != "" {
+		e, err := analytics.NewLifecycle(producer, "run", id, eventType, to, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		e.DurationMS = duration.Milliseconds()
+		if err := analytics.InsertTx(ctx, tx, e); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func Renew(ctx context.Context, db *sql.DB, id, owner string, until time.Time) error {
@@ -480,25 +563,25 @@ func Retry(ctx context.Context, db *sql.DB, id, phase, message string, notBefore
 		column, next, dead = "report_attempts", "report_pending", "report_dead"
 	}
 	q := fmt.Sprintf("UPDATE runs SET state=CASE WHEN %s+1>=? THEN ? ELSE ? END,%s=%s+1,not_before=?,last_error=?,lease_owner=NULL,lease_until=NULL WHERE run_id=?", column, column, column)
-	_, err := db.ExecContext(ctx, q, max, dead, next, notBefore.Unix(), message, id)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, q, max, dead, next, notBefore.Unix(), message, id)
 	if err != nil {
 		return fmt.Errorf("retry run: %w", err)
 	}
-	return nil
+	if err := eventTx(ctx, tx, "queue", "run", id+":"+next, "run_lifecycle", next, notBefore); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func FinishReport(ctx context.Context, db *sql.DB, id, owner, state string) error {
 	if state != "complete" && state != "reply_suppressed" {
 		return errors.New("invalid report terminal state")
 	}
-	r, err := db.ExecContext(ctx, "UPDATE runs SET state=?,lease_owner=NULL,lease_until=NULL WHERE run_id=? AND state='report_leased' AND lease_owner=?", state, id, owner)
-	if err != nil {
-		return fmt.Errorf("finish report: %w", err)
-	}
-	n, _ := r.RowsAffected()
-	if n != 1 {
-		return errors.New("report lease not owned")
-	}
-	return nil
+	return transition(ctx, db, id, owner, ReportLeased, state, "reporter")
 }
 
 // QuarantineReply records an unknowable post-DATA outcome. It is deliberately
@@ -507,7 +590,12 @@ func QuarantineReply(ctx context.Context, db *sql.DB, id, owner, message string)
 	if len(message) > 1024 {
 		message = message[:1024]
 	}
-	r, err := db.ExecContext(ctx, "UPDATE runs SET state='report_dead',last_error=?,lease_owner=NULL,lease_until=NULL WHERE run_id=? AND state='report_leased' AND lease_owner=?", message, id, owner)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	r, err := tx.ExecContext(ctx, "UPDATE runs SET state='report_dead',last_error=?,lease_owner=NULL,lease_until=NULL WHERE run_id=? AND state='report_leased' AND lease_owner=?", message, id, owner)
 	if err != nil {
 		return fmt.Errorf("quarantine reply: %w", err)
 	}
@@ -518,7 +606,10 @@ func QuarantineReply(ctx context.Context, db *sql.DB, id, owner, message string)
 	if n != 1 {
 		return errors.New("report lease not owned")
 	}
-	return nil
+	if err := eventTx(ctx, tx, "reporter", "run", id+":quarantine", "report_delivery_state", "unknown", time.Now().UTC()); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Redeliver returns only a dead run to the report queue. It never changes an
@@ -539,9 +630,22 @@ func Redeliver(ctx context.Context, db *sql.DB, id string) error {
 }
 
 func Replay(ctx context.Context, db *sql.DB, deliveryID, runID string, now time.Time) error {
-	_, err := db.ExecContext(ctx, `INSERT INTO runs(run_id,delivery_id,state,created_at) VALUES(?,?,?,?)`, runID, deliveryID, Queued, now.Unix())
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `INSERT INTO runs(run_id,delivery_id,state,created_at) VALUES(?,?,?,?)`, runID, deliveryID, Queued, now.Unix())
 	if err != nil {
 		return fmt.Errorf("replay run: %w", err)
 	}
-	return nil
+	return tx.Commit()
+}
+
+func eventTx(ctx context.Context, tx *sql.Tx, producer, sourceType, sourceID, eventType, outcome string, now time.Time) error {
+	e, err := analytics.NewLifecycle(producer, sourceType, sourceID, eventType, outcome, now)
+	if err != nil {
+		return err
+	}
+	return analytics.InsertTx(ctx, tx, e)
 }
