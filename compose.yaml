@@ -16,23 +16,9 @@ x-resources: &resources
   deploy:
     resources:
       limits: {cpus: "1.0", memory: 512M, pids: 256}
-x-mailproof-build: &mailproof-build
-  context: .
-  dockerfile: containers/mailproof/Dockerfile
-  args:
-    MAILPROOF_VERSION: ${MAILPROOF_VERSION:-dev}
-  labels:
-    org.opencontainers.image.version: ${MAILPROOF_VERSION:-dev}
-
 services:
   init:
-    build:
-      context: .
-      dockerfile: containers/init/Dockerfile
-      args:
-        DEBIAN_BASE: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
-        DEBIAN_SNAPSHOT: ${DEBIAN_SNAPSHOT:-20260814T000000Z}
-        OPENSSL_VERSION: ${OPENSSL_VERSION:-3.5.6-1~deb13u2}
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-init"
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     environment:
       MAILPROOF_REPORT_RECIPIENT: ${MAILPROOF_REPORT_RECIPIENT:-operator@example.org}
@@ -51,14 +37,7 @@ services:
     logging: *logging
 
   postfix:
-    build:
-      context: .
-      dockerfile: containers/postfix/Dockerfile
-      args:
-        DEBIAN_BASE: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
-        POSTFIX_VERSION: ${POSTFIX_VERSION:-3.10.11-0+deb13u1}
-        CA_CERTIFICATES_VERSION: ${CA_CERTIFICATES_VERSION:-20250419}
-        DEBIAN_SNAPSHOT: ${DEBIAN_SNAPSHOT:-20260814T000000Z}
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-postfix"
     depends_on:
       init: {condition: service_completed_successfully}
       dovecot: {condition: service_healthy}
@@ -78,13 +57,7 @@ services:
     logging: *logging
 
   dovecot:
-    build:
-      context: .
-      dockerfile: containers/dovecot/Dockerfile
-      args:
-        DEBIAN_BASE: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
-        DOVECOT_VERSION: ${DOVECOT_VERSION:-1:2.4.1+dfsg1-6+deb13u6}
-        DEBIAN_SNAPSHOT: ${DEBIAN_SNAPSHOT:-20260814T000000Z}
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-dovecot"
     depends_on: {init: {condition: service_completed_successfully}}
     networks: [mail]
     volumes:
@@ -101,7 +74,7 @@ services:
     logging: *logging
 
   collector:
-    build: *mailproof-build
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-app"
     command: ["collect", "--watch", "--postfix-log", "/postfix-log/ingress.log", "--token-registry", "/runtime/secrets/token-registry.json"]
     depends_on: {dovecot: {condition: service_healthy}}
     networks: [mail]
@@ -122,7 +95,7 @@ services:
     logging: *logging
 
   worker:
-    build: *mailproof-build
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-app"
     command: ["worker"]
     depends_on:
       collector: {condition: service_healthy}
@@ -142,7 +115,7 @@ services:
   # Reporter is intentionally isolated from analyzer and public networks. Its
   # private key is available only through the read-only runtime volume.
   reporter:
-    build: *mailproof-build
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-app"
     command: ["reporter"]
     depends_on:
       collector: {condition: service_healthy}
@@ -158,14 +131,7 @@ services:
 
   smoke:
     profiles: [smoke]
-    build:
-      context: .
-      dockerfile: containers/smoke/Dockerfile
-      args:
-        DEBIAN_BASE: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
-        NETCAT_OPENBSD_VERSION: ${NETCAT_OPENBSD_VERSION:-1.229-1}
-        PYTHON3_VERSION: ${PYTHON3_VERSION:-3.13.5-1}
-        DEBIAN_SNAPSHOT: ${DEBIAN_SNAPSHOT:-20260814T000000Z}
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-smoke"
     depends_on:
       postfix: {condition: service_healthy}
       dovecot: {condition: service_healthy}
@@ -178,7 +144,7 @@ services:
     logging: *logging
 
   redis:
-    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT:-20260814T000000Z}", PACKAGES: "redis-server=${REDIS_VERSION:-5:8.0.2-3+deb13u2}"}}
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-redis"
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     environment: {MAILPROOF_ANALYZER_ROLE: redis}
     networks: [analyzer]
@@ -188,7 +154,7 @@ services:
     logging: *logging
 
   unbound:
-    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT:-20260814T000000Z}", PACKAGES: "unbound=${UNBOUND_VERSION:-1.22.0-2+deb13u3} dns-root-data=${DNS_ROOT_DATA_VERSION:-2025080400~deb13u1}"}}
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-unbound"
     environment: {MAILPROOF_ANALYZER_ROLE: unbound}
     networks: [analyzer]
     # Debian's default config creates control/pid files, binds port 53, and
@@ -202,7 +168,7 @@ services:
   clamav:
     depends_on:
       clamav-db-init: {condition: service_completed_successfully}
-    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT:-20260814T000000Z}", PACKAGES: "clamav-daemon=${CLAMAV_VERSION:-1.4.3+dfsg-1}"}}
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-clamav"
     environment: {MAILPROOF_ANALYZER_ROLE: clamav}
     networks: [scanner]
     # clamd drops to its package user during startup; these are the minimal
@@ -227,15 +193,7 @@ services:
     logging: *logging
 
   clamav-db-init:
-    build:
-      context: .
-      dockerfile: containers/clamav-provisioner/Dockerfile
-      args:
-        DEBIAN_BASE: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
-        DEBIAN_SNAPSHOT: ${DEBIAN_SNAPSHOT:-20260814T000000Z}
-        CLAMAV_VERSION: ${CLAMAV_VERSION:-1.4.3+dfsg-1}
-        CURL_VERSION: ${CURL_VERSION:-8.14.1-2+deb13u4}
-        CA_CERTIFICATES_VERSION: ${CA_CERTIFICATES_VERSION:-20250419}
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-clamav-provisioner"
     environment:
       MAILPROOF_CLAMAV_PROVISION: ${MAILPROOF_CLAMAV_PROVISION:-none}
       MAILPROOF_CLAMAV_DATABASE: ${MAILPROOF_CLAMAV_DATABASE:-main}
@@ -248,15 +206,7 @@ services:
 
   clamav-updater:
     profiles: [clamav-updater]
-    build:
-      context: .
-      dockerfile: containers/clamav-provisioner/Dockerfile
-      args:
-        DEBIAN_BASE: ${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}
-        DEBIAN_SNAPSHOT: ${DEBIAN_SNAPSHOT:-20260814T000000Z}
-        CLAMAV_VERSION: ${CLAMAV_VERSION:-1.4.3+dfsg-1}
-        CURL_VERSION: ${CURL_VERSION:-8.14.1-2+deb13u4}
-        CA_CERTIFICATES_VERSION: ${CA_CERTIFICATES_VERSION:-20250419}
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-clamav-provisioner"
     command: [update-loop]
     environment:
       MAILPROOF_CLAMAV_PROVISION: ${MAILPROOF_CLAMAV_PROVISION:-none}
@@ -266,7 +216,7 @@ services:
     logging: *logging
 
   olefy:
-    build: {context: ., dockerfile: containers/olefy/Dockerfile, args: {PYTHON_BASE: "${PYTHON_OLEFY_BASE:-python@sha256:4c2cf9917bd1cbacc5e9b07320025bdb7cdf2df7b0ceaccb55e9dd7e30987419}"}}
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-olefy"
     networks: [scanner]
     healthcheck: {test: ["CMD-SHELL", "python3 -c 'import socket; s=socket.create_connection((\"127.0.0.1\",10050),2); s.close()'"], interval: 10s, timeout: 3s, retries: 12}
     <<: [*hardening, *resources]
@@ -274,7 +224,7 @@ services:
     logging: *logging
 
   rspamd:
-    build: {context: ., dockerfile: containers/analyzer/Dockerfile, args: {DEBIAN_BASE: "${DEBIAN_BASE:-debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258}", DEBIAN_SNAPSHOT: "${DEBIAN_SNAPSHOT:-20260814T000000Z}", PACKAGES: "rspamd=${RSPAMD_VERSION:-3.12.1-1}"}}
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-rspamd"
     environment: {MAILPROOF_ANALYZER_ROLE: rspamd}
     depends_on:
       redis: {condition: service_healthy}

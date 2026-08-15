@@ -64,8 +64,9 @@ for the complete trust model.
 
 ## Requirements
 
-- Linux on amd64 or arm64, subject to availability of every pinned Debian
-  package for that architecture.
+- Linux amd64 for the published release images. Other Linux architectures can
+  build from source when every pinned base image and Debian package is
+  available for the target architecture.
 - Docker Engine 27.0 or newer.
 - Docker Compose plugin 2.30 or newer.
 - An available host SMTP port; the default is `2525`.
@@ -75,14 +76,25 @@ for the complete trust model.
 The deployment is deliberately single-host: SQLite and Docker named volumes
 are not a multi-host queue or object store.
 
-## Quick start
+## Quick start on Linux amd64
 
-Clone the source and create a deployment environment:
+Each release publishes public, reusable Linux amd64 images to GHCR and a
+Compose file pinned to their immutable digests. Clone the matching tag so the
+Compose file can mount its versioned configuration, then download the release
+deployment file and checksum. Replace `v0.2.0` with the release you want:
 
 ```bash
-git clone https://github.com/LuganoPlanB/mailproof.git
+MAILPROOF_RELEASE=v0.2.0
+git clone --branch "${MAILPROOF_RELEASE}" --depth 1 \
+  https://github.com/LuganoPlanB/mailproof.git
 cd mailproof
+curl --fail --location --remote-name \
+  "https://github.com/LuganoPlanB/mailproof/releases/download/${MAILPROOF_RELEASE}/mailproof-${MAILPROOF_RELEASE}.compose.yaml"
+curl --fail --location --remote-name \
+  "https://github.com/LuganoPlanB/mailproof/releases/download/${MAILPROOF_RELEASE}/mailproof-${MAILPROOF_RELEASE}.compose.yaml.sha256"
+sha256sum --check "mailproof-${MAILPROOF_RELEASE}.compose.yaml.sha256"
 cp .env.example .env
+printf '\nCOMPOSE_FILE=mailproof-%s.compose.yaml\n' "${MAILPROOF_RELEASE}" >>.env
 ```
 
 For a local evaluation, set `MAILPROOF_CLAMAV_PROVISION=latest` in `.env`.
@@ -93,7 +105,8 @@ the dry run before making changes:
 ```bash
 scripts/init.sh --dry-run --report-recipient operator@example.org
 scripts/init.sh --confirm --report-recipient operator@example.org
-docker compose up -d --build --wait
+docker compose pull
+docker compose up -d --wait
 ```
 
 Verify the complete ingress path with a synthetic message:
@@ -107,6 +120,30 @@ docker compose ps
 SMTP is available on `localhost:2525` unless `MAILPROOF_SMTP_PORT` is changed.
 Run `docker compose down` to stop the project while retaining its named
 volumes. **Never run `docker compose down -v` against authoritative data.**
+
+## Build from source on other architectures
+
+The release registry currently contains Linux amd64 images only. On arm64 or
+another Linux architecture, build the matching source tag locally. Compose
+automatically merges `compose.override.yaml`, which contains all build
+definitions, with the image-only base deployment:
+
+```bash
+MAILPROOF_RELEASE=v0.2.0
+git clone --branch "${MAILPROOF_RELEASE}" --depth 1 \
+  https://github.com/LuganoPlanB/mailproof.git
+cd mailproof
+cp .env.example .env
+docker compose --profile smoke build --pull
+scripts/init.sh --dry-run --report-recipient operator@example.org
+scripts/init.sh --confirm --report-recipient operator@example.org
+docker compose up -d --wait
+```
+
+This is a native build, not emulation. It succeeds only where the locked base
+images and every version in `config/versions.env` exist for that architecture.
+Do not set `COMPOSE_FILE` for this path: doing so would bypass the automatic
+source-build override.
 
 ## ClamAV database provisioning
 
@@ -188,17 +225,20 @@ and are not backup inputs.
 
 Releases begin at [`v0.1.0`](https://github.com/LuganoPlanB/mailproof/releases/tag/v0.1.0).
 Each release contains a Compose file stamped with the Mailproof version and a
-portable SHA-256 checksum. The same version is embedded in `mailproof version`
-and the OCI application-image label.
+portable SHA-256 checksum. It references public Linux amd64 images in GHCR by
+immutable digest, so deployment never performs a local image build. The same
+version is embedded in `mailproof version` and every OCI image version label.
 
 To verify downloaded release assets:
 
 ```bash
-sha256sum --check mailproof-v0.1.0.compose.yaml.sha256
+sha256sum --check mailproof-v0.2.0.compose.yaml.sha256
 ```
 
-The released Compose file uses this repository as its build context, so place
-it at the root of the matching source tag before building.
+Place the released Compose file at the root of the matching source tag: its
+relative mounts intentionally use the reviewed configuration from that tag.
+Set `COMPOSE_FILE` in `.env` as shown above so operator scripts and ordinary
+`docker compose` commands consistently select the pull-only release file.
 
 Successful quality runs on `main` invoke the release workflow. Conventional
 `docs:` and `docs(scope):` commits do not publish software, and changes limited

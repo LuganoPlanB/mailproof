@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: release-main
@@ -75,23 +76,85 @@ jobs:
           [[ ${NEXT_VERSION} =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           printf 'RELEASE_VERSION=%s\n' "${NEXT_VERSION}" >>"${GITHUB_ENV}"
 
+      - name: Log in to GHCR
+        if: steps.tags.outputs.exists == 'false' || steps.release_changes.outputs.eligible == 'true'
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and publish the amd64 release images
+        if: steps.tags.outputs.exists == 'false' || steps.release_changes.outputs.eligible == 'true'
+        shell: bash
+        env:
+          DOCKER_DEFAULT_PLATFORM: linux/amd64
+          MAILPROOF_IMAGE: ghcr.io/luganoplanb/mailproof
+        run: |
+          set -Eeuo pipefail
+          [[ $(uname -m) == x86_64 ]]
+          export MAILPROOF_VERSION=${RELEASE_VERSION}
+          services=(init postfix dovecot collector smoke redis unbound clamav clamav-db-init olefy rspamd)
+          docker compose --env-file config/versions.env --profile smoke build --pull "${services[@]}"
+          docker compose --env-file config/versions.env --profile smoke push "${services[@]}"
+
+      - name: Require the GHCR package to be public
+        if: steps.tags.outputs.exists == 'false' || steps.release_changes.outputs.eligible == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          visibility=$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/mailproof" \
+            --jq .visibility)
+          if [[ ${visibility} != public ]]; then
+            printf '%s\n' '::error::The ghcr.io/luganoplanb/mailproof package must be public. Open the package settings, change visibility once, then re-run this workflow.'
+            exit 1
+          fi
+
       - name: Stamp and validate the release Compose file
         if: steps.tags.outputs.exists == 'false' || steps.release_changes.outputs.eligible == 'true'
         id: compose
         shell: bash
+        env:
+          DOCKER_DEFAULT_PLATFORM: linux/amd64
         run: |
           set -Eeuo pipefail
           [[ ${RELEASE_VERSION} =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          mkdir -p dist
-          artifact="dist/mailproof-${RELEASE_VERSION}.compose.yaml"
-          placeholder='$'
-          placeholder+='{MAILPROOF_VERSION:-dev}'
-          sed "s/${placeholder}/${RELEASE_VERSION}/g" compose.yaml >"${artifact}"
-          if grep -Fq "${placeholder}" "${artifact}"; then
-            printf '%s\n' 'release version placeholder was not fully stamped' >&2
+          artifact="mailproof-${RELEASE_VERSION}.compose.yaml"
+          version_placeholder='$'
+          version_placeholder+='{MAILPROOF_VERSION:-dev}'
+          image_placeholder='$'
+          image_placeholder+='{MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}'
+          sed \
+            -e "s|${version_placeholder}|${RELEASE_VERSION}|g" \
+            -e "s|${image_placeholder}|ghcr.io/luganoplanb/mailproof|g" \
+            compose.yaml >"${artifact}"
+          if grep -Fq "${version_placeholder}" "${artifact}" || grep -Fq "${image_placeholder}" "${artifact}"; then
+            printf '%s\n' 'release image placeholders were not fully stamped' >&2
             exit 1
           fi
-          grep -Fq "MAILPROOF_VERSION: ${RELEASE_VERSION}" "${artifact}"
+          grep -Fq "mailproof:${RELEASE_VERSION}-app" "${artifact}"
+          if grep -Eq '^[[:space:]]+build:' "${artifact}"; then
+            printf '%s\n' 'released Compose file unexpectedly contains build instructions' >&2
+            exit 1
+          fi
+
+          docker logout ghcr.io
+          image=ghcr.io/luganoplanb/mailproof
+          components=(app init postfix dovecot smoke redis unbound clamav clamav-provisioner olefy rspamd)
+          for component in "${components[@]}"; do
+            tagged="${image}:${RELEASE_VERSION}-${component}"
+            docker image rm --force "${tagged}" >/dev/null 2>&1 || true
+            docker pull --platform linux/amd64 "${tagged}"
+            digest_ref=$(docker image inspect "${tagged}" --format '{{index .RepoDigests 0}}')
+            [[ ${digest_ref} == "${image}@sha256:"* ]]
+            sed -i "s|${tagged}|${digest_ref}|g" "${artifact}"
+          done
+
+          grep -Fq 'ghcr.io/luganoplanb/mailproof@sha256:' "${artifact}"
           docker compose --project-directory . --env-file config/versions.env -f "${artifact}" config --quiet
           (
             cd "$(dirname "${artifact}")"
@@ -99,15 +162,31 @@ jobs:
           ) >"${artifact}.sha256"
           printf 'artifact=%s\n' "${artifact}" >>"${GITHUB_OUTPUT}"
 
-      - name: Verify the stamped application image
+      - name: Smoke-test the published release images
         if: steps.tags.outputs.exists == 'false' || steps.release_changes.outputs.eligible == 'true'
         shell: bash
+        env:
+          DOCKER_DEFAULT_PLATFORM: linux/amd64
+          MAILPROOF_CLAMAV_PROVISION: latest
+          RELEASE_COMPOSE: ${{ steps.compose.outputs.artifact }}
         run: |
           set -Eeuo pipefail
-          MAILPROOF_VERSION=${RELEASE_VERSION} docker compose --env-file config/versions.env build collector
-          actual=$(MAILPROOF_VERSION=${RELEASE_VERSION} docker compose --env-file config/versions.env run --rm --no-deps collector version)
+          export COMPOSE_FILE=${RELEASE_COMPOSE}
+          cleanup() {
+            status=$?
+            set +e
+            docker compose logs --no-color --tail=200
+            docker compose down
+            exit "${status}"
+          }
+          trap cleanup EXIT
+          docker compose up -d --wait
+          docker compose exec -T rspamd rspamadm configtest
+          bash scripts/smoke.sh --confirm
+          actual=$(docker compose run --rm --no-deps collector version)
           python3 -c 'import json, sys; assert json.loads(sys.argv[1])["version"] == sys.argv[2]' "${actual}" "${RELEASE_VERSION}"
-          label=$(docker image inspect mailproof-collector --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
+          image=$(docker compose images -q collector)
+          label=$(docker image inspect "${image}" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
           [[ ${label} == "${RELEASE_VERSION}" ]]
 
       - name: Create the GitHub release

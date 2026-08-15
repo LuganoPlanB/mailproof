@@ -58,17 +58,29 @@
   [ "$status" -eq 0 ]
   config=$output
 
-  run python3 -c 'import json, sys; service=json.loads(sys.argv[1])["services"]["collector"]; assert service["build"]["args"]["MAILPROOF_VERSION"] == "v0.1.0"; assert service["build"]["labels"]["org.opencontainers.image.version"] == "v0.1.0"' "$config"
+  run python3 -c 'import json, sys; service=json.loads(sys.argv[1])["services"]["collector"]; assert service["image"] == "ghcr.io/luganoplanb/mailproof:v0.1.0-app"; assert service["build"]["args"]["MAILPROOF_VERSION"] == "v0.1.0"; assert service["build"]["labels"]["org.opencontainers.image.version"] == "v0.1.0"' "$config"
   [ "$status" -eq 0 ]
 }
 
-@test "release workflow bootstraps and stamps v0.1.0" {
-  run python3 -c 'from pathlib import Path; workflow=Path(".github/workflows/release.yml").read_text(); assert "ietf-tools/semver-action@c90370b2958652d71c06a3484129a4d423a6d8a8" in workflow; assert "RELEASE_VERSION=v0.1.0" in workflow; assert "MAILPROOF_VERSION:-dev" in workflow; assert "workflow_run.head_sha == github.sha" in workflow; assert "scripts/release-eligible.sh" in workflow; assert "sha256sum \"$(basename" in workflow; assert "gh release create" in workflow'
+@test "source Compose builds while the release definition is image-only" {
+  run env MAILPROOF_VERSION=v9.8.7 docker compose --env-file config/versions.env -f compose.yaml config --format json
+  [ "$status" -eq 0 ]
+  config=$output
+
+  run python3 -c 'import json, sys; services=json.loads(sys.argv[1])["services"]; assert all("build" not in service for service in services.values()); assert services["collector"]["image"] == "ghcr.io/luganoplanb/mailproof:v9.8.7-app"' "$config"
+  [ "$status" -eq 0 ]
+
+  run python3 -c 'from pathlib import Path; dockerfiles={str(p) for p in Path("containers").glob("*/Dockerfile")}; override=Path("compose.override.yaml").read_text(); assert dockerfiles; assert all(path in override for path in dockerfiles)'
+  [ "$status" -eq 0 ]
+}
+
+@test "release workflow publishes public amd64 images before the release" {
+  run python3 -c 'from pathlib import Path; workflow=Path(".github/workflows/release.yml").read_text(); assert "ietf-tools/semver-action@c90370b2958652d71c06a3484129a4d423a6d8a8" in workflow; assert "RELEASE_VERSION=v0.1.0" in workflow; assert "MAILPROOF_VERSION:-dev" in workflow; assert "MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof" in workflow; assert "workflow_run.head_sha == github.sha" in workflow; assert "scripts/release-eligible.sh" in workflow; assert "packages: write" in workflow; assert "DOCKER_DEFAULT_PLATFORM: linux/amd64" in workflow; assert "docker compose --env-file config/versions.env --profile smoke push" in workflow; assert "visibility=$(gh api" in workflow; assert "docker logout ghcr.io" in workflow; assert "mailproof@sha256:" in workflow; assert workflow.index("Smoke-test the published release images") < workflow.index("Create the GitHub release"); assert "sha256sum \"$(basename" in workflow; assert "gh release create" in workflow'
   [ "$status" -eq 0 ]
 }
 
 @test "quality skips code jobs for documentation-only changes" {
-  run python3 -c 'from pathlib import Path; workflow=Path(".github/workflows/quality.yml").read_text(); assert "Classify software changes" in workflow; assert "scripts/release-eligible.sh" in workflow; assert "if: needs.classify.outputs.software == '\''true'\''" in workflow; assert "needs: [classify, go-and-shell]" in workflow'
+  run python3 -c 'from pathlib import Path; workflow=Path(".github/workflows/quality.yml").read_text(); assert "Classify software changes" in workflow; assert "scripts/release-eligible.sh" in workflow; assert "if: needs.classify.outputs.software == '\''true'\''" in workflow; assert "needs: [classify, go-and-shell]" in workflow; assert "--profile smoke build --pull" in workflow'
   [ "$status" -eq 0 ]
 }
 

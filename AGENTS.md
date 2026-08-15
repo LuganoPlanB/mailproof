@@ -51,6 +51,9 @@ before changing this path or the meaning of evidence.
 - `internal/report/`: rendering, replies, signing, and verification.
 - `compose.yaml`, `containers/`, `config/`: production topology, images, pinned
   versions, and service configuration.
+- `compose.override.yaml`: automatically loaded source-build definitions. The
+  base `compose.yaml` is intentionally image-only so it can be released as a
+  pull-based deployment without local build instructions.
 - `scripts/`: operator orchestration; `tests/shell/`: Bats contracts.
 - `docs/adr/` and `docs/runbooks/`: architectural authority and operations.
 
@@ -71,6 +74,11 @@ before changing this path or the meaning of evidence.
   label. Releases bootstrap at `v0.1.0`, then use conventional commits through
   the SHA-pinned `ietf-tools/semver-action`; keep released Compose files stamped
   and accompanied by their SHA-256 checksum.
+- Release images are public Linux amd64 tags under the single
+  `ghcr.io/luganoplanb/mailproof` package. Build and push every unique image before
+  creating the GitHub release, make the released Compose file digest-pinned,
+  and smoke-test it after logging out of GHCR. Other architectures build from
+  source through the automatically merged Compose override.
 - Documentation changes run only the lightweight CI classifier: `docs:`
   commits and changes limited to `README.md` or `docs/` must skip code-quality,
   build, Compose smoke, and software release jobs. Keep both quality and release
