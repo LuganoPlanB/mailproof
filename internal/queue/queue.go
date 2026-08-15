@@ -28,15 +28,42 @@ type Run struct {
 	LeaseUntil            time.Time
 }
 
+// ReportDestination is the trusted, immutable routing snapshot for a delivery.
+// It is deliberately separate from message headers and mutable submitter state.
+type ReportDestination struct {
+	SubmitterID  string
+	ReplyAddress string
+}
+
+var ErrNoReportDestination = errors.New("no report destination for delivery")
+
 // EnqueueCollection atomically records an immutable delivery and its first run.
 // Repeating the same delivery ID is idempotent; it never mutates prior rows.
 func EnqueueCollection(ctx context.Context, db *sql.DB, deliveryID, digest, sourceKey, runID string, now time.Time) error {
+	return enqueueCollection(ctx, db, deliveryID, digest, sourceKey, runID, nil, now)
+}
+
+// EnqueueAdmittedCollection records a delivery with the mailbox proven during
+// enrollment. The snapshot remains usable after later capability rotation or
+// submitter revocation.
+func EnqueueAdmittedCollection(ctx context.Context, db *sql.DB, deliveryID, digest, sourceKey, runID string, destination ReportDestination, now time.Time) error {
+	if destination.SubmitterID == "" || destination.ReplyAddress == "" {
+		return errors.New("admitted delivery requires report destination")
+	}
+	return enqueueCollection(ctx, db, deliveryID, digest, sourceKey, runID, &destination, now)
+}
+
+func enqueueCollection(ctx context.Context, db *sql.DB, deliveryID, digest, sourceKey, runID string, destination *ReportDestination, now time.Time) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin collection: %w", err)
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO deliveries(delivery_id,message_digest,source_key,collected_at) VALUES(?,?,?,?) ON CONFLICT(source_key) DO NOTHING`, deliveryID, digest, sourceKey, now.Unix()); err != nil {
+	var submitterID, replyAddress any
+	if destination != nil {
+		submitterID, replyAddress = destination.SubmitterID, destination.ReplyAddress
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO deliveries(delivery_id,message_digest,source_key,collected_at,submitter_id,reply_address) VALUES(?,?,?,?,?,?) ON CONFLICT(source_key) DO NOTHING`, deliveryID, digest, sourceKey, now.Unix(), submitterID, replyAddress); err != nil {
 		return fmt.Errorf("insert delivery: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO runs(run_id,delivery_id,state,created_at) VALUES(?,?,?,?) ON CONFLICT(run_id) DO NOTHING`, runID, deliveryID, Queued, now.Unix()); err != nil {
@@ -48,15 +75,101 @@ func EnqueueCollection(ctx context.Context, db *sql.DB, deliveryID, digest, sour
 	return nil
 }
 
+// SnapshotReportDestination resolves an active enrolled submitter exactly once,
+// before the snapshot is persisted on an admitted delivery.
+func SnapshotReportDestination(ctx context.Context, db *sql.DB, submitterID string) (ReportDestination, error) {
+	var destination ReportDestination
+	err := db.QueryRowContext(ctx, `SELECT submitter_id,canonical_address FROM submitters WHERE submitter_id=? AND status='active'`, submitterID).Scan(&destination.SubmitterID, &destination.ReplyAddress)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ReportDestination{}, ErrNoReportDestination
+	}
+	if err != nil {
+		return ReportDestination{}, fmt.Errorf("lookup submitter report destination: %w", err)
+	}
+	return destination, nil
+}
+
+// ReportDestinationForRun returns only a delivery's persisted snapshot. It
+// never follows the mutable submitter registry or message-supplied addresses.
+func ReportDestinationForRun(ctx context.Context, db *sql.DB, runID string) (ReportDestination, error) {
+	var destination ReportDestination
+	var submitterID, replyAddress sql.NullString
+	err := db.QueryRowContext(ctx, `SELECT d.submitter_id,d.reply_address FROM deliveries d JOIN runs r ON r.delivery_id=d.delivery_id WHERE r.run_id=?`, runID).Scan(&submitterID, &replyAddress)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ReportDestination{}, ErrNoReportDestination
+	}
+	if err != nil {
+		return ReportDestination{}, fmt.Errorf("lookup delivery report destination: %w", err)
+	}
+	if !submitterID.Valid || !replyAddress.Valid || submitterID.String == "" || replyAddress.String == "" {
+		return ReportDestination{}, ErrNoReportDestination
+	}
+	destination.SubmitterID, destination.ReplyAddress = submitterID.String, replyAddress.String
+	return destination, nil
+}
+
+// BeginReportAttempt records a distinct durable attempt before any SMTP
+// connection is made. Capability material is intentionally not part of this
+// lifecycle record.
+func BeginReportAttempt(ctx context.Context, db *sql.DB, runID string, destination ReportDestination, now time.Time) (int64, error) {
+	result, err := db.ExecContext(ctx, `INSERT INTO report_delivery_attempts(run_id,submitter_id,reply_address,started_at,outcome,error_class) VALUES(?,?,?,?,?,?)`, runID, destination.SubmitterID, destination.ReplyAddress, now.Unix(), "started", "")
+	if err != nil {
+		return 0, fmt.Errorf("begin report delivery attempt: %w", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("report delivery attempt ID: %w", err)
+	}
+	return id, nil
+}
+
+func FinishReportAttempt(ctx context.Context, db *sql.DB, attemptID int64, outcome, errorClass string, finished time.Time) error {
+	if outcome != "accepted" && outcome != "failed" && outcome != "unknown" {
+		return errors.New("invalid report delivery outcome")
+	}
+	if errorClass != "" && errorClass != "smtp" {
+		return errors.New("invalid report delivery error class")
+	}
+	result, err := db.ExecContext(ctx, `UPDATE report_delivery_attempts SET finished_at=?,outcome=?,error_class=? WHERE attempt_id=? AND outcome='started'`, finished.Unix(), outcome, errorClass, attemptID)
+	if err != nil {
+		return fmt.Errorf("finish report delivery attempt: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("report delivery attempt rows: %w", err)
+	}
+	if n != 1 {
+		return errors.New("report delivery attempt not active")
+	}
+	return nil
+}
+
 // RecordRejectedCollection preserves the sealed delivery and its auditable
 // post-DATA rejection without creating an analyzer run.
 func RecordRejectedCollection(ctx context.Context, db *sql.DB, deliveryID, digest, sourceKey, decisionID, reason string, now time.Time) error {
+	return recordRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, reason, nil, now)
+}
+
+// RecordAdmittedRejectedCollection retains the verified destination snapshot
+// for a post-DATA rejection without consulting untrusted message fields.
+func RecordAdmittedRejectedCollection(ctx context.Context, db *sql.DB, deliveryID, digest, sourceKey, decisionID, reason string, destination ReportDestination, now time.Time) error {
+	if destination.SubmitterID == "" || destination.ReplyAddress == "" {
+		return errors.New("admitted rejection requires report destination")
+	}
+	return recordRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, reason, &destination, now)
+}
+
+func recordRejectedCollection(ctx context.Context, db *sql.DB, deliveryID, digest, sourceKey, decisionID, reason string, destination *ReportDestination, now time.Time) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin rejected collection: %w", err)
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO deliveries(delivery_id,message_digest,source_key,collected_at) VALUES(?,?,?,?) ON CONFLICT(source_key) DO NOTHING`, deliveryID, digest, sourceKey, now.Unix()); err != nil {
+	var submitterID, replyAddress any
+	if destination != nil {
+		submitterID, replyAddress = destination.SubmitterID, destination.ReplyAddress
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO deliveries(delivery_id,message_digest,source_key,collected_at,submitter_id,reply_address) VALUES(?,?,?,?,?,?) ON CONFLICT(source_key) DO NOTHING`, deliveryID, digest, sourceKey, now.Unix(), submitterID, replyAddress); err != nil {
 		return fmt.Errorf("insert rejected delivery: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO submission_decisions(decision_id,envelope_sender,recipient,peer_ip,helo,spf_outcome,stage,reason_code,policy_version,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, decisionID, "", "", "", "", "", "post_data", reason, "v1", now.Unix()); err != nil {
@@ -161,7 +274,14 @@ CREATE INDEX admission_events_window ON admission_events(submitter_id, admitted_
  state TEXT NOT NULL CHECK(state IN ('pending','leased','complete','dead')) DEFAULT 'pending',
  created_at INTEGER NOT NULL, lease_owner TEXT, lease_until INTEGER, last_error TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX rejection_work_items_claim ON rejection_work_items(state, lease_until, created_at);`}}
+	CREATE INDEX rejection_work_items_claim ON rejection_work_items(state, lease_until, created_at);`}, {5, `ALTER TABLE deliveries ADD COLUMN submitter_id TEXT REFERENCES submitters(submitter_id);
+	ALTER TABLE deliveries ADD COLUMN reply_address TEXT;`}, {6, `CREATE TABLE report_delivery_attempts (
+ attempt_id INTEGER PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(run_id), submitter_id TEXT NOT NULL,
+ reply_address TEXT NOT NULL, started_at INTEGER NOT NULL, finished_at INTEGER,
+ outcome TEXT NOT NULL CHECK(outcome IN ('started','accepted','failed','unknown')),
+ error_class TEXT NOT NULL DEFAULT '', postfix_queue_id TEXT
+);
+CREATE INDEX report_delivery_attempts_run ON report_delivery_attempts(run_id, attempt_id);`}}
 	for _, migration := range migrations {
 		version := migration.version
 		var exists int

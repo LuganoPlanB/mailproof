@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -16,7 +17,7 @@ func TestClaimDoesNotDoubleClaim(t *testing.T) {
 	}
 	defer db.Close()
 	now := time.Now().UTC()
-	if _, err := db.Exec(`INSERT INTO deliveries VALUES ('d', 'digest', 'source', ?); INSERT INTO runs(run_id,delivery_id,state,created_at) VALUES ('r','d','queued',?)`, now.Unix(), now.Unix()); err != nil {
+	if _, err := db.Exec(`INSERT INTO deliveries(delivery_id,message_digest,source_key,collected_at) VALUES ('d', 'digest', 'source', ?); INSERT INTO runs(run_id,delivery_id,state,created_at) VALUES ('r','d','queued',?)`, now.Unix(), now.Unix()); err != nil {
 		t.Fatal(err)
 	}
 	first, err := Claim(context.Background(), db, "one", "analysis", now, time.Minute)
@@ -74,7 +75,7 @@ func TestClaimRecoversExpiredLease(t *testing.T) {
 	}
 	defer db.Close()
 	now := time.Now().UTC()
-	if _, err := db.Exec(`INSERT INTO deliveries VALUES ('d', 'digest', 'source', ?)`, now.Unix()); err != nil {
+	if _, err := db.Exec(`INSERT INTO deliveries(delivery_id,message_digest,source_key,collected_at) VALUES ('d', 'digest', 'source', ?)`, now.Unix()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO runs(run_id,delivery_id,state,lease_owner,lease_until,created_at) VALUES ('r','d','analysis_leased','dead',?,?)`, now.Add(-time.Minute).Unix(), now.Unix()); err != nil {
@@ -93,7 +94,7 @@ func TestRetryMovesAnalysisToDeadAtLimit(t *testing.T) {
 	}
 	defer db.Close()
 	now := time.Now()
-	if _, err := db.Exec(`INSERT INTO deliveries VALUES ('d','x','s',?)`, now.Unix()); err != nil {
+	if _, err := db.Exec(`INSERT INTO deliveries(delivery_id,message_digest,source_key,collected_at) VALUES ('d','x','s',?)`, now.Unix()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO runs(run_id,delivery_id,state,created_at) VALUES ('r','d','queued',?)`, now.Unix()); err != nil {
@@ -118,7 +119,7 @@ func TestReportClaimRenewAndFinish(t *testing.T) {
 	}
 	defer db.Close()
 	now := time.Now()
-	if _, err := db.Exec(`INSERT INTO deliveries VALUES ('d','x','s',?)`, now.Unix()); err != nil {
+	if _, err := db.Exec(`INSERT INTO deliveries(delivery_id,message_digest,source_key,collected_at) VALUES ('d','x','s',?)`, now.Unix()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO runs(run_id,delivery_id,state,created_at) VALUES ('r','d','report_pending',?)`, now.Unix()); err != nil {
@@ -143,7 +144,7 @@ func TestUnknownReplyIsQuarantinedAndCanOnlyBeExplicitlyRedelivered(t *testing.T
 	}
 	defer db.Close()
 	now := time.Now()
-	if _, err := db.Exec(`INSERT INTO deliveries VALUES ('d','x','s',?)`, now.Unix()); err != nil {
+	if _, err := db.Exec(`INSERT INTO deliveries(delivery_id,message_digest,source_key,collected_at) VALUES ('d','x','s',?)`, now.Unix()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO runs(run_id,delivery_id,state,created_at) VALUES ('r','d','report_pending',?)`, now.Unix()); err != nil {
@@ -173,8 +174,87 @@ func TestMigrationRecordsVersion(t *testing.T) {
 	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
+	if version != 6 {
 		t.Fatalf("version=%d", version)
+	}
+}
+
+func TestReportAttemptRecordsKnownAndUnknownOutcomes(t *testing.T) {
+	db, err := Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Unix(1700000000, 0).UTC()
+	if _, err := db.Exec(`INSERT INTO submitters(submitter_id,canonical_address,status,created_at,policy_version,minute_limit,hour_limit,day_limit) VALUES('submitter','verified@example.test','active',?,'v1',1,1,1)`, now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	destination := ReportDestination{SubmitterID: "submitter", ReplyAddress: "verified@example.test"}
+	if err := EnqueueAdmittedCollection(context.Background(), db, "delivery", "digest", "source", "run", destination, now); err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := BeginReportAttempt(context.Background(), db, "run", destination, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := FinishReportAttempt(context.Background(), db, attempt, "unknown", "smtp", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var outcome, capability string
+	if err := db.QueryRow(`SELECT outcome, error_class FROM report_delivery_attempts WHERE attempt_id=?`, attempt).Scan(&outcome, &capability); err != nil {
+		t.Fatal(err)
+	}
+	if outcome != "unknown" || capability != "smtp" {
+		t.Fatalf("attempt=%q/%q", outcome, capability)
+	}
+}
+
+func TestAdmittedDeliverySnapshotsDestinationForReplayAndRevocation(t *testing.T) {
+	db, err := Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Unix(1700000000, 0).UTC()
+	if _, err := db.Exec(`INSERT INTO submitters(submitter_id,canonical_address,status,created_at,policy_version,minute_limit,hour_limit,day_limit) VALUES('submitter','verified@example.test','active',?,'v1',1,1,1)`, now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	destination, err := SnapshotReportDestination(context.Background(), db, "submitter")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := EnqueueAdmittedCollection(context.Background(), db, "delivery", "digest", "source", "run", destination, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE submitters SET status='revoked',canonical_address='changed@example.test' WHERE submitter_id='submitter'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := Replay(context.Background(), db, "delivery", "replay", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for _, runID := range []string{"run", "replay"} {
+		got, err := ReportDestinationForRun(context.Background(), db, runID)
+		if err != nil || got != destination {
+			t.Fatalf("destination for %s = %#v, %v", runID, got, err)
+		}
+	}
+}
+
+func TestLegacyDeliverySuppressesAutomaticReply(t *testing.T) {
+	db, err := Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now()
+	if _, err := db.Exec(`INSERT INTO deliveries(delivery_id,message_digest,source_key,collected_at) VALUES('legacy','digest','source',?)`, now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO runs(run_id,delivery_id,state,created_at) VALUES('run','legacy','report_pending',?)`, now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReportDestinationForRun(context.Background(), db, "run"); !errors.Is(err, ErrNoReportDestination) {
+		t.Fatalf("lookup error = %v, want ErrNoReportDestination", err)
 	}
 }
 
@@ -197,6 +277,29 @@ func TestRecordRejectedCollectionEnqueuesNotarization(t *testing.T) {
 	}
 	if deliveries != 1 || work != 1 {
 		t.Fatalf("deliveries=%d work=%d", deliveries, work)
+	}
+}
+
+func TestAdmittedRejectedDeliveryRetainsVerifiedDestination(t *testing.T) {
+	db, err := Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Unix(1700000000, 0).UTC()
+	if _, err := db.Exec(`INSERT INTO submitters(submitter_id,canonical_address,status,created_at,policy_version,minute_limit,hour_limit,day_limit) VALUES('submitter','verified@example.test','active',?,'v1',1,1,1)`, now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	destination := ReportDestination{SubmitterID: "submitter", ReplyAddress: "verified@example.test"}
+	if err := RecordAdmittedRejectedCollection(context.Background(), db, "delivery", "digest", "source", "decision", "sender_denied", destination, now); err != nil {
+		t.Fatal(err)
+	}
+	var submitterID, replyAddress string
+	if err := db.QueryRow(`SELECT submitter_id,reply_address FROM deliveries WHERE delivery_id='delivery'`).Scan(&submitterID, &replyAddress); err != nil {
+		t.Fatal(err)
+	}
+	if submitterID != destination.SubmitterID || replyAddress != destination.ReplyAddress {
+		t.Fatalf("destination=%q/%q", submitterID, replyAddress)
 	}
 }
 
