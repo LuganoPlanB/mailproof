@@ -80,7 +80,10 @@ jobs:
           fi
           grep -Fq "MAILPROOF_VERSION: ${RELEASE_VERSION}" "${artifact}"
           docker compose --project-directory . --env-file config/versions.env -f "${artifact}" config --quiet
-          sha256sum "${artifact}" >"${artifact}.sha256"
+          (
+            cd "$(dirname "${artifact}")"
+            sha256sum "$(basename "${artifact}")"
+          ) >"${artifact}.sha256"
           printf 'artifact=%s\n' "${artifact}" >>"${GITHUB_OUTPUT}"
 
       - name: Verify the stamped application image
