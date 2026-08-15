@@ -1,14 +1,17 @@
 ARG GO_BUILDER=golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36
 ARG DEBIAN_BASE=debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
 FROM ${GO_BUILDER} AS build
+ARG MAILPROOF_VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum* ./
 RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
-RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/mailproof ./cmd/mailproof
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${MAILPROOF_VERSION}" -o /out/mailproof ./cmd/mailproof
 
 FROM ${DEBIAN_BASE}
+ARG MAILPROOF_VERSION=dev
+LABEL org.opencontainers.image.version="${MAILPROOF_VERSION}"
 RUN groupadd --gid 1000 mailproof && useradd --uid 1000 --gid 1000 --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin mailproof
 COPY --from=build /out/mailproof /usr/local/bin/mailproof
 USER mailproof:mailproof

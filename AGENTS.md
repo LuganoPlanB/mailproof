@@ -67,6 +67,10 @@ before changing this path or the meaning of evidence.
   directories, including container entrypoints, with shfmt's defaults.
 - Pin base images and Debian/Python dependencies through `config/versions.env`
   and the existing lock files. Avoid floating versions in release paths.
+- `MAILPROOF_VERSION` flows from Compose into the Mailproof binary and OCI image
+  label. Releases bootstrap at `v0.1.0`, then use conventional commits through
+  the SHA-pinned `ietf-tools/semver-action`; keep released Compose files stamped
+  and accompanied by their SHA-256 checksum.
 - Preserve Compose hardening (`no-new-privileges`, dropped capabilities,
   read-only filesystems, resource limits) and expose a host port only through
   Postfix unless an accepted ADR changes the boundary.

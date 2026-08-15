@@ -2,13 +2,14 @@ name: quality
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
   go-and-shell:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/setup-go@v6
         with: {go-version: '1.26.6'}
       - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends bats shellcheck shfmt
@@ -31,7 +32,7 @@ jobs:
     env:
       MAILPROOF_CLAMAV_PROVISION: latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Build and start the complete graph
         run: docker compose --env-file config/versions.env up -d --build --wait
       - name: Validate Rspamd configuration and smoke delivery
