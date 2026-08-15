@@ -34,6 +34,27 @@ The accepted decisions are documented in
 [the artifact identity ADR](docs/adr/0002-artifact-identity.md), and
 [the v1 capability ADR](docs/adr/0003-v1-capabilities.md).
 
+## Sender admission and results
+
+An operator enrolls a forwarding mailbox before it can submit mail. The
+submission address is a secret capability: it is accepted only when its SMTP
+envelope sender matches the enrolled mailbox and the locally evaluated SPF
+check passes. The wrapper forwarder and the selected message sender are
+deliberately different identities. After the delivered bytes are sealed, the
+collector selects the canonical subject and optionally permits only its domain;
+this eligibility check does not authenticate that selected sender.
+
+Set `MAILPROOF_SUBJECT_SENDER_DOMAIN_ALLOWLIST=lugano.ch` in the protected
+deployment `.env` before first initialization to permit exactly that selected
+subject domain. `*.lugano.ch` permits subdomains only; an empty value permits
+any syntactically valid selected sender. Restart the collector after a
+configuration change. Invalid entries fail collection closed, so correct the
+deployment configuration and restart rather than editing generated runtime
+state.
+
+Use the enrollment, recovery, and API procedures in the
+[sender and analytics runbook](docs/runbooks/backup-restore.md#submitter-enrollment-and-recovery).
+
 ## Architecture
 
 ```mermaid

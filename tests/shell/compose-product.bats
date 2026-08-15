@@ -21,6 +21,20 @@
   [[ "$output" == *"target: /etc/rspamd/plugins.d"* ]]
 }
 
+@test "admission, collector, and results API have bounded private wiring" {
+  run docker compose --env-file config/versions.env config --format json
+  [ "$status" -eq 0 ]
+  config=$output
+
+  run python3 -c 'import json, sys; services=json.loads(sys.argv[1])["services"]; admission=services["admission"]; collector=services["collector"]; api=services["results-api"]; assert set(admission["networks"]) == {"mail"}; assert "--admission-stamp-key" in collector["command"]; assert "--subject-domain-allowlist" in collector["command"]; assert set(api["networks"]) == {"analytics"}; assert "ports" not in api; assert any(volume["target"] == "/artifacts" and volume["read_only"] for volume in api["volumes"]); assert "results-api-token" in api["healthcheck"]["test"][-1]' "$config"
+  [ "$status" -eq 0 ]
+}
+
+@test "init bootstraps a validated selected-subject policy from deployment configuration" {
+  run python3 -c 'from pathlib import Path; compose=Path("compose.yaml").read_text(); init=Path("containers/init/entrypoint.sh").read_text(); env=Path(".env.example").read_text(); assert "MAILPROOF_SUBJECT_SENDER_DOMAIN_ALLOWLIST" in compose; assert "subject-sender-domain-allowlist" in init; assert "MAILPROOF_SUBJECT_SENDER_DOMAIN_ALLOWLIST=lugano.ch" in env; assert "chmod 0600" in init'
+  [ "$status" -eq 0 ]
+}
+
 @test "ClamAV has its documented memory floor" {
   run docker compose --env-file config/versions.env config --format json
   [ "$status" -eq 0 ]
@@ -49,7 +63,7 @@
 }
 
 @test "CI stops the singleton collector before a one-shot sweep" {
-  run python3 -c 'from pathlib import Path; workflow=Path(".github/workflows/quality.yml").read_text(); assert workflow.index("docker compose stop collector") < workflow.index("docker compose run --rm --no-deps collector collect --once"); assert "docker compose run --rm --no-deps worker worker --drain" in workflow'
+  run python3 -c 'from pathlib import Path; workflow=Path(".github/workflows/quality.yml").read_text(); assert workflow.index("docker compose stop collector") < workflow.index("docker compose run --rm --no-deps collector collect --once"); assert "docker compose run --rm --no-deps worker worker --drain" in workflow; assert "docker compose ps -q results-api" in workflow; assert ".State.Health.Status" in workflow'
   [ "$status" -eq 0 ]
 }
 
@@ -70,7 +84,7 @@
   run python3 -c 'import json, sys; services=json.loads(sys.argv[1])["services"]; assert all("build" not in service for service in services.values()); assert services["collector"]["image"] == "ghcr.io/luganoplanb/mailproof:v9.8.7-app"' "$config"
   [ "$status" -eq 0 ]
 
-  run python3 -c 'from pathlib import Path; dockerfiles={str(p) for p in Path("containers").glob("*/Dockerfile")}; override=Path("compose.override.yaml").read_text(); assert dockerfiles; assert all(path in override for path in dockerfiles)'
+  run python3 -c 'from pathlib import Path; dockerfiles={str(p) for p in Path("containers").glob("*/Dockerfile")}; override=Path("compose.override.yaml").read_text(); assert dockerfiles; assert all(path in override for path in dockerfiles); assert "results-api:" in override and "build: *mailproof-build" in override'
   [ "$status" -eq 0 ]
 }
 

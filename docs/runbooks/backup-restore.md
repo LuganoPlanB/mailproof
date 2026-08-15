@@ -56,3 +56,48 @@ address immediately stops working. Never edit SQLite or runtime JSON manually.
 through `scripts/backup.sh`. If a key is lost, restore it from the verified
 backup before startup. If the capability key cannot be recovered, revoke and
 re-enroll affected submitters: keyed digests cannot be recovered or re-keyed.
+
+## Sender policy, rejection, and analytics operations
+
+Before the first `scripts/init.sh --confirm`, set the selected-subject policy
+in the protected `.env`. Leave `MAILPROOF_SUBJECT_SENDER_DOMAIN_ALLOWLIST`
+empty to allow any syntactically valid selected sender, set it to `lugano.ch`
+to allow exactly that domain, or set it to `*.lugano.ch` for subdomains only.
+This policy is applied after DATA to the subject selected from the sealed
+message; it never restricts the independently verified forwarding mailbox.
+Malformed entries fail the collector closed at startup. Change the protected
+deployment configuration, restart the collector, and verify the health check;
+do not edit generated runtime files.
+
+Pre-DATA admission failures are returned to the connecting MTA and create no
+outbound backscatter. Post-DATA selected-subject failures are durably queued,
+notarized asynchronously, and delivered only to the verified forwarder
+snapshot. A queued or failed notarization is not a signed result: inspect the
+decision's notarization status, restore reporter/key access, and let the
+durable outbox retry. Preserve the decision and its artifact directory during
+incident response.
+
+The results API is internal-only. Retrieve its bearer token only from the
+protected runtime secret through an approved operator channel; never put it in
+`.env`, a URL, shell history, or a reverse-proxy header. A reverse proxy must
+remain on the internal `analytics` network and must not publish the API without
+an accepted architecture change. With a protected token variable, a consumer
+can query bounded JSON projections:
+
+```bash
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer ${MAILPROOF_RESULTS_TOKEN}" \
+  'http://results-api:8080/v1/results?limit=50'
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer ${MAILPROOF_RESULTS_TOKEN}" \
+  'http://results-api:8080/v1/analytics/summary?from=2026-08-01T00:00:00Z&to=2026-08-02T00:00:00Z&interval=day'
+```
+
+Use only the documented filters, page cursor, and UTC ranges in
+[`results-api-v1.md`](../results-api-v1.md). On token leakage, replace the
+mode-0600 runtime token through the approved secret-rotation procedure, restart
+the API, and treat prior API access as potentially disclosed. Rebuild result
+projections only with the documented `mailproof results rebuild --dry-run` then
+`--confirm` operation when it is available in the deployed version, after
+verifying signed artifacts. Until then, recover projections by restoring the
+verified backup; never reconstruct them by parsing raw mail or editing SQLite.
