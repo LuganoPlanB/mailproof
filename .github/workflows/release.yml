@@ -32,12 +32,24 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          tags=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*')
-          if [[ -n ${tags} ]]; then
+          mapfile -t tags < <(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname)
+          if ((${#tags[@]} > 0)); then
             printf '%s\n' 'exists=true' >>"${GITHUB_OUTPUT}"
+            printf 'latest=%s\n' "${tags[0]}" >>"${GITHUB_OUTPUT}"
           else
             printf '%s\n' 'exists=false' >>"${GITHUB_OUTPUT}"
           fi
+
+      - name: Classify release-worthy changes
+        if: steps.tags.outputs.exists == 'true'
+        id: release_changes
+        shell: bash
+        env:
+          LATEST_TAG: ${{ steps.tags.outputs.latest }}
+        run: |
+          set -Eeuo pipefail
+          eligible=$(scripts/release-eligible.sh "${LATEST_TAG}" HEAD)
+          printf 'eligible=%s\n' "${eligible}" >>"${GITHUB_OUTPUT}"
 
       - name: Bootstrap the first release
         if: steps.tags.outputs.exists == 'false'
@@ -45,7 +57,7 @@ jobs:
         run: printf '%s\n' 'RELEASE_VERSION=v0.1.0' >>"${GITHUB_ENV}"
 
       - name: Calculate the next release
-        if: steps.tags.outputs.exists == 'true'
+        if: steps.tags.outputs.exists == 'true' && steps.release_changes.outputs.eligible == 'true'
         id: semver
         uses: ietf-tools/semver-action@c90370b2958652d71c06a3484129a4d423a6d8a8 # v1.11.0
         with:
@@ -54,7 +66,7 @@ jobs:
           patchAll: true
 
       - name: Select the calculated release
-        if: steps.tags.outputs.exists == 'true'
+        if: steps.tags.outputs.exists == 'true' && steps.release_changes.outputs.eligible == 'true'
         shell: bash
         env:
           NEXT_VERSION: ${{ steps.semver.outputs.next }}
@@ -64,6 +76,7 @@ jobs:
           printf 'RELEASE_VERSION=%s\n' "${NEXT_VERSION}" >>"${GITHUB_ENV}"
 
       - name: Stamp and validate the release Compose file
+        if: steps.tags.outputs.exists == 'false' || steps.release_changes.outputs.eligible == 'true'
         id: compose
         shell: bash
         run: |
@@ -87,6 +100,7 @@ jobs:
           printf 'artifact=%s\n' "${artifact}" >>"${GITHUB_OUTPUT}"
 
       - name: Verify the stamped application image
+        if: steps.tags.outputs.exists == 'false' || steps.release_changes.outputs.eligible == 'true'
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -97,6 +111,7 @@ jobs:
           [[ ${label} == "${RELEASE_VERSION}" ]]
 
       - name: Create the GitHub release
+        if: steps.tags.outputs.exists == 'false' || steps.release_changes.outputs.eligible == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           QUALIFIED_SHA: ${{ github.event.workflow_run.head_sha }}

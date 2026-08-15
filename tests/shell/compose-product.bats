@@ -63,7 +63,7 @@
 }
 
 @test "release workflow bootstraps and stamps v0.1.0" {
-  run python3 -c 'from pathlib import Path; workflow=Path(".github/workflows/release.yml").read_text(); assert "ietf-tools/semver-action@c90370b2958652d71c06a3484129a4d423a6d8a8" in workflow; assert "RELEASE_VERSION=v0.1.0" in workflow; assert "MAILPROOF_VERSION:-dev" in workflow; assert "workflow_run.head_sha == github.sha" in workflow; assert "sha256sum \"$(basename" in workflow; assert "gh release create" in workflow'
+  run python3 -c 'from pathlib import Path; workflow=Path(".github/workflows/release.yml").read_text(); assert "ietf-tools/semver-action@c90370b2958652d71c06a3484129a4d423a6d8a8" in workflow; assert "RELEASE_VERSION=v0.1.0" in workflow; assert "MAILPROOF_VERSION:-dev" in workflow; assert "workflow_run.head_sha == github.sha" in workflow; assert "scripts/release-eligible.sh" in workflow; assert "sha256sum \"$(basename" in workflow; assert "gh release create" in workflow'
   [ "$status" -eq 0 ]
 }
 

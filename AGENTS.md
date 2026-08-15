@@ -71,6 +71,9 @@ before changing this path or the meaning of evidence.
   label. Releases bootstrap at `v0.1.0`, then use conventional commits through
   the SHA-pinned `ietf-tools/semver-action`; keep released Compose files stamped
   and accompanied by their SHA-256 checksum.
+- Quality CI still runs for documentation changes, but `docs:` commits and
+  changes limited to `README.md` or `docs/` must not create a software release.
+  Keep release eligibility centralized in `scripts/release-eligible.sh`.
 - Preserve Compose hardening (`no-new-privileges`, dropped capabilities,
   read-only filesystems, resource limits) and expose a host port only through
   Postfix unless an accepted ADR changes the boundary.

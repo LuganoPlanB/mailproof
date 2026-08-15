@@ -20,3 +20,9 @@ commits by the pinned `ietf-tools/semver-action`. Each GitHub release contains a
 Compose file with `MAILPROOF_VERSION` stamped into its application-image build
 arguments and an adjacent SHA-256 checksum. The same value is embedded in the
 `mailproof version` output and the OCI image version label.
+
+Quality checks run for every `main` commit. Release calculation is skipped when
+all changes since the latest tag are confined to `README.md` or `docs/`, and
+commits with a `docs:` or conventional `docs(scope):` prefix never make a
+revision release-worthy. A commit that changes both software and documentation
+remains eligible.
