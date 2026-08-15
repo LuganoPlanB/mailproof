@@ -205,7 +205,13 @@ services:
       - clamav-db:/var/lib/clamav:ro
       - ./config/clamav/clamd.conf:/etc/clamav/clamd.conf:ro
     healthcheck: {test: ["CMD-SHELL", "clamdscan --version >/dev/null"], interval: 10s, timeout: 5s, retries: 12}
-    <<: [*hardening, *resources]
+    # ClamAV documents a 3 GiB minimum and 4 GiB preferred allocation for
+    # loading current signature databases. The shared 512 MiB limit kills
+    # clamd with SIGKILL (exit 137) before it can become healthy.
+    deploy:
+      resources:
+        limits: {cpus: "1.0", memory: "${MAILPROOF_CLAMAV_MEMORY_LIMIT:-4G}", pids: 256}
+    <<: *hardening
     tmpfs: [/tmp, /run, /var/run/clamav, /var/log/clamav]
     logging: *logging
 

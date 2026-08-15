@@ -66,6 +66,9 @@ before changing this path or the meaning of evidence.
 - Preserve Compose hardening (`no-new-privileges`, dropped capabilities,
   read-only filesystems, resource limits) and expose a host port only through
   Postfix unless an accepted ADR changes the boundary.
+- ClamAV is the resource exception: its configurable default is 4 GiB and must
+  remain at least 3 GiB for current signature databases. Do not apply the shared
+  512 MiB service limit to `clamav`.
 - Add focused tests beside changed Go packages. Update Bats/contract tests for
   observable shell or Compose changes. Update an ADR when changing an accepted
   evidence or capability decision.

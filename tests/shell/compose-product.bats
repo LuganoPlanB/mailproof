@@ -21,6 +21,15 @@
   [[ "$output" == *"target: /etc/rspamd/plugins.d"* ]]
 }
 
+@test "ClamAV has its documented memory floor" {
+  run docker compose --env-file config/versions.env config --format json
+  [ "$status" -eq 0 ]
+  config=$output
+
+  run python3 -c 'import json, sys; assert int(json.loads(sys.argv[1])["services"]["clamav"]["deploy"]["resources"]["limits"]["memory"]) >= 3 * 1024**3' "$config"
+  [ "$status" -eq 0 ]
+}
+
 @test "backup and restore runbooks expose dry-run-first commands" {
   run scripts/backup.sh --dry-run --output /tmp/mailproof-backup
   [ "$status" -eq 0 ]
