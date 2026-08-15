@@ -44,6 +44,12 @@ subject domain, never a raw address. Unknown is literal `unknown`; absent is
 `null`; neither is silently merged. Dashboard queries cap range to 366 days,
 ranked values to 50, series to six, and filter cardinality to 100 values.
 
+Latency p95 is calculated from a bounded exponential histogram, not retained
+per-message samples: duration counts are folded into millisecond buckets
+`[1,2), [2,4), …, [65536,131072)` with the last bucket capped at 24 hours.
+The reported percentile is the lower bound of the first bucket whose cumulative
+count reaches 95%; absent observations are `unknown` rather than zero.
+
 ## Funnel and reconciliation
 
 The clickable funnel is `recipient_hit → policy_outcome=accepted →

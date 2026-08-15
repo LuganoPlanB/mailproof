@@ -394,7 +394,9 @@ CREATE TABLE analytics_cursor (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
 INSERT INTO analytics_cursor(singleton,event_id) VALUES(1,0);
 CREATE TABLE metric_rollups (bucket_start INTEGER NOT NULL, granularity TEXT NOT NULL CHECK(granularity IN ('minute','hour','day')), metric TEXT NOT NULL, outcome TEXT NOT NULL, schema_version INTEGER NOT NULL, dimension_key TEXT NOT NULL DEFAULT '{}', event_count INTEGER NOT NULL, source_high_watermark INTEGER NOT NULL, PRIMARY KEY(bucket_start,granularity,metric,outcome,schema_version,dimension_key));
 CREATE TABLE analytics_projector_lease (singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner TEXT NOT NULL, until INTEGER NOT NULL);
-CREATE TABLE analytics_backup_markers (marker_id INTEGER PRIMARY KEY CHECK(marker_id=1), verified_at INTEGER NOT NULL, manifest_digest TEXT NOT NULL);`}}
+CREATE TABLE analytics_backup_markers (marker_id INTEGER PRIMARY KEY CHECK(marker_id=1), verified_at INTEGER NOT NULL, manifest_digest TEXT NOT NULL);`}, {9, `CREATE INDEX metric_rollups_dashboard ON metric_rollups(granularity,bucket_start,metric,event_count,source_high_watermark);
+CREATE INDEX runs_dashboard_current ON runs(state);
+CREATE INDEX rejection_work_items_dashboard_current ON rejection_work_items(state);`}}
 	for _, migration := range migrations {
 		version := migration.version
 		var exists int
