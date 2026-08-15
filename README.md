@@ -202,15 +202,17 @@ it at the root of the matching source tag before building.
 
 Successful quality runs on `main` invoke the release workflow. Conventional
 `docs:` and `docs(scope):` commits do not publish software, and changes limited
-to `README.md` or `docs/` remain quality-tested without creating a version.
-Commits that change both software and documentation remain release-eligible.
+to `README.md` or `docs/` stop after a lightweight change-classification job:
+they run neither the code-quality suite nor the Compose smoke and do not create
+a version. Commits that change both software and documentation remain eligible
+for the complete quality and release pipelines.
 
 ## Development
 
-The project targets Go 1.26.6. The authoritative quality workflow runs module
-verification, formatting, unit and race tests, vet, staticcheck,
-`govulncheck`, ShellCheck, shfmt, Bats contracts, Compose validation and builds,
-then a complete remote Compose smoke test.
+The project targets Go 1.26.6. For software changes, the authoritative quality
+workflow runs module verification, formatting, unit and race tests, vet,
+staticcheck, `govulncheck`, ShellCheck, shfmt, Bats contracts, Compose validation
+and builds, then a complete remote Compose smoke test.
 
 The most useful local checks are:
 

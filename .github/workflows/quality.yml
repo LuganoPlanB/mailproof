@@ -6,7 +6,38 @@ on:
   pull_request:
 
 jobs:
+  classify:
+    runs-on: ubuntu-24.04
+    outputs:
+      software: ${{ steps.changes.outputs.software }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - name: Classify software changes
+        id: changes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          set -Eeuo pipefail
+          base=${PUSH_BASE}
+          if [[ ${EVENT_NAME} == pull_request ]]; then
+            base=${PR_BASE}
+          fi
+          if git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+            software=$(scripts/release-eligible.sh "${base}" HEAD)
+          else
+            printf 'comparison base is unavailable; running the full quality suite\n' >&2
+            software=true
+          fi
+          printf 'software=%s\n' "${software}" >>"${GITHUB_OUTPUT}"
+
   go-and-shell:
+    needs: classify
+    if: needs.classify.outputs.software == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -27,7 +58,8 @@ jobs:
       - run: docker compose --env-file config/versions.env build --pull
 
   compose-smoke:
-    needs: go-and-shell
+    needs: [classify, go-and-shell]
+    if: needs.classify.outputs.software == 'true' && needs.go-and-shell.result == 'success'
     runs-on: ubuntu-24.04
     env:
       MAILPROOF_CLAMAV_PROVISION: latest

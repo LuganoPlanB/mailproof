@@ -67,6 +67,11 @@
   [ "$status" -eq 0 ]
 }
 
+@test "quality skips code jobs for documentation-only changes" {
+  run python3 -c 'from pathlib import Path; workflow=Path(".github/workflows/quality.yml").read_text(); assert "Classify software changes" in workflow; assert "scripts/release-eligible.sh" in workflow; assert "if: needs.classify.outputs.software == '\''true'\''" in workflow; assert "needs: [classify, go-and-shell]" in workflow'
+  [ "$status" -eq 0 ]
+}
+
 @test "backup and restore runbooks expose dry-run-first commands" {
   run scripts/backup.sh --dry-run --output /tmp/mailproof-backup
   [ "$status" -eq 0 ]

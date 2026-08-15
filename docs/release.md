@@ -21,8 +21,9 @@ Compose file with `MAILPROOF_VERSION` stamped into its application-image build
 arguments and an adjacent SHA-256 checksum. The same value is embedded in the
 `mailproof version` output and the OCI image version label.
 
-Quality checks run for every `main` commit. Release calculation is skipped when
-all changes since the latest tag are confined to `README.md` or `docs/`, and
-commits with a `docs:` or conventional `docs(scope):` prefix never make a
-revision release-worthy. A commit that changes both software and documentation
-remains eligible.
+Every `main` commit runs a lightweight change-classification job. The code,
+security, build, and Compose smoke jobs are skipped when all changes are
+confined to `README.md` or `docs/`, or when commits use a `docs:` or
+conventional `docs(scope):` prefix. Release calculation follows the same rule.
+A commit that changes both software and documentation remains eligible unless
+it explicitly uses a documentation prefix.
