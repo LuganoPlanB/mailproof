@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -14,9 +15,11 @@ import (
 	"net"
 	"net/http"
 	"net/smtp"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -26,6 +29,7 @@ import (
 	"github.com/luganoplanb/mailproof/internal/analyzers"
 	"github.com/luganoplanb/mailproof/internal/artifact"
 	"github.com/luganoplanb/mailproof/internal/budget"
+	"github.com/luganoplanb/mailproof/internal/dashboard"
 	"github.com/luganoplanb/mailproof/internal/evidence"
 	"github.com/luganoplanb/mailproof/internal/ingress"
 	"github.com/luganoplanb/mailproof/internal/intel"
@@ -57,7 +61,7 @@ func exitCode(err error) int {
 }
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: mailproof {version|collect|worker|reporter|intel-projector|intel|analytics-projector|analytics|results-api|status|inspect|replay|bundle|verify-report|redeliver|submitter|admission}")
+		return errors.New("usage: mailproof {version|dashboard|collect|worker|reporter|intel-projector|intel|analytics-projector|analytics|results-api|status|inspect|replay|bundle|verify-report|redeliver|submitter|admission}")
 	}
 	switch args[0] {
 	case "version":
@@ -78,6 +82,8 @@ func run(ctx context.Context, args []string) error {
 		return analyticsCommand(ctx, args[1:])
 	case "results-api":
 		return resultsAPI(ctx, args[1:])
+	case "dashboard":
+		return dashboardCommand(ctx, args[1:])
 	case "status":
 		return status(ctx, args[1:])
 	case "inspect":
@@ -97,6 +103,60 @@ func run(ctx context.Context, args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func dashboardCommand(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("dashboard", flag.ContinueOnError)
+	host := fs.String("host", "127.0.0.1", "listen host")
+	port := fs.Int("port", 3000, "listen port")
+	publicOrigin := fs.String("public-origin", "", "public browser origin")
+	resultsURL := fs.String("results-url", "", "internal results API origin")
+	resultsTokenFile := fs.String("results-token-file", "", "results API bearer token file")
+	sessionKeyFile := fs.String("session-key-file", "", "dashboard session MAC key file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *port < 1 || *port > 65535 || *resultsURL == "" || *resultsTokenFile == "" || *sessionKeyFile == "" {
+		return errors.New("dashboard requires valid --host, --port, --results-url, --results-token-file, and --session-key-file")
+	}
+	base, err := url.Parse(*resultsURL)
+	if err != nil || base.Scheme == "" || base.Host == "" || base.User != nil || base.Path != "" || base.RawQuery != "" || base.Fragment != "" {
+		return errors.New("dashboard results URL must be an origin")
+	}
+	origin := *publicOrigin
+	if origin == "" {
+		origin = "http://localhost:" + strconv.Itoa(*port)
+	}
+	browserOrigin, err := url.Parse(origin)
+	if err != nil || browserOrigin.Scheme == "" || browserOrigin.Host == "" || browserOrigin.User != nil || browserOrigin.Path != "" || browserOrigin.RawQuery != "" || browserOrigin.Fragment != "" || (browserOrigin.Scheme != "https" && !(browserOrigin.Scheme == "http" && browserOrigin.Hostname() == "localhost")) {
+		return errors.New("dashboard public origin must be an allowed absolute origin")
+	}
+	if !dashboardLoopbackHost(*host) && *publicOrigin == "" {
+		return errors.New("dashboard non-loopback bind requires --public-origin")
+	}
+	token, err := os.ReadFile(*resultsTokenFile)
+	if err != nil || len(token) < 32 {
+		return errors.New("dashboard results token must contain at least 32 bytes")
+	}
+	key, err := os.ReadFile(*sessionKeyFile)
+	if err != nil || len(key) < 32 {
+		return errors.New("dashboard session key must contain at least 32 bytes")
+	}
+	server := &http.Server{Addr: net.JoinHostPort(*host, strconv.Itoa(*port)), Handler: dashboard.NewWithConfig(dashboard.ResultsClient{BaseURL: base, Token: bytes.TrimSpace(token)}, dashboard.Config{PublicOrigin: browserOrigin, SessionKey: key}), ReadHeaderTimeout: 2 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+	go func() { <-ctx.Done(); _ = server.Shutdown(context.Background()) }()
+	err = server.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+func dashboardLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func intelCommand(ctx context.Context, args []string) error {
