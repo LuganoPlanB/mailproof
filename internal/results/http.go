@@ -1,6 +1,7 @@
 package results
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
@@ -8,13 +9,25 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/luganoplanb/mailproof/internal/analytics"
 )
 
 // API is the internal driver adapter. It intentionally exposes projections,
 // never raw artifacts, SMTP facts, capabilities, or report destinations.
 type API struct {
 	Repository Repository
+	Dashboard  Dashboard
 	Token      []byte
+}
+
+// Dashboard is the narrow analytics read port consumed by the internal HTTP
+// adapter. Keeping it here makes the driver testable without SQLite access.
+type Dashboard interface {
+	Overview(context.Context, analytics.Query) (analytics.Snapshot, error)
+	Funnel(context.Context, analytics.Query) (analytics.Snapshot, error)
+	Series(context.Context, analytics.Query) (analytics.Snapshot, error)
+	Operations(context.Context, analytics.Query) (analytics.Snapshot, error)
 }
 
 func (a API) Handler() http.Handler {
@@ -25,6 +38,10 @@ func (a API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/decisions", a.decisions)
 	mux.HandleFunc("GET /v1/decisions/", a.decision)
 	mux.HandleFunc("GET /v1/analytics/summary", a.summary)
+	mux.HandleFunc("GET /v1/dashboard/overview", a.overview)
+	mux.HandleFunc("GET /v1/dashboard/funnel", a.funnel)
+	mux.HandleFunc("GET /v1/dashboard/series", a.series)
+	mux.HandleFunc("GET /v1/dashboard/operations", a.operations)
 	return securityHeaders(auth(a.Token, mux))
 }
 
@@ -89,6 +106,58 @@ func (a API) summary(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeQueryError(w, err)
+}
+
+func (a API) overview(w http.ResponseWriter, r *http.Request)   { a.dashboard(w, r, "overview") }
+func (a API) funnel(w http.ResponseWriter, r *http.Request)     { a.dashboard(w, r, "funnel") }
+func (a API) series(w http.ResponseWriter, r *http.Request)     { a.dashboard(w, r, "series") }
+func (a API) operations(w http.ResponseWriter, r *http.Request) { a.dashboard(w, r, "operations") }
+
+func (a API) dashboard(w http.ResponseWriter, r *http.Request, kind string) {
+	q, err := dashboardQuery(r)
+	if err == nil && a.Dashboard != nil {
+		var snapshot analytics.Snapshot
+		switch kind {
+		case "overview":
+			snapshot, err = a.Dashboard.Overview(r.Context(), q)
+		case "funnel":
+			snapshot, err = a.Dashboard.Funnel(r.Context(), q)
+		case "series":
+			snapshot, err = a.Dashboard.Series(r.Context(), q)
+		case "operations":
+			snapshot, err = a.Dashboard.Operations(r.Context(), q)
+		}
+		if err == nil {
+			writeJSON(w, http.StatusOK, map[string]any{"schema_version": 1, "filters": q, "generated_at": snapshot.GeneratedAt, "data_through": snapshot.DataThrough, "observed_at": snapshot.ObservedAt, "high_watermark": snapshot.HighWatermark, "projection_lag_seconds": snapshot.ProjectionLag, "p95_latency_ms": snapshot.P95LatencyMS, "latency_known": snapshot.LatencyKnown, "partial": snapshot.Partial, "stale": snapshot.Stale, "values": snapshot.Values, "buckets": snapshot.Buckets})
+			return
+		}
+	}
+	writeQueryError(w, err)
+}
+
+func dashboardQuery(r *http.Request) (analytics.Query, error) {
+	q := r.URL.Query()
+	known := map[string]bool{"from": true, "to": true, "interval": true, "metric": true, "dimension": true, "series": true, "cards": true}
+	for k, values := range q {
+		if !known[k] || len(values) != 1 {
+			return analytics.Query{}, analytics.ErrInvalidQuery
+		}
+	}
+	from, err := time.Parse(time.RFC3339, q.Get("from"))
+	if err != nil {
+		return analytics.Query{}, analytics.ErrInvalidQuery
+	}
+	to, err := time.Parse(time.RFC3339, q.Get("to"))
+	if err != nil {
+		return analytics.Query{}, analytics.ErrInvalidQuery
+	}
+	split := func(raw string) []string {
+		if raw == "" {
+			return nil
+		}
+		return strings.Split(raw, ",")
+	}
+	return analytics.Query{From: from, To: to, Interval: q.Get("interval"), Metric: q.Get("metric"), Dimension: q.Get("dimension"), Series: split(q.Get("series")), Cards: split(q.Get("cards"))}, nil
 }
 
 func filter(r *http.Request) (Filter, error) {
@@ -160,7 +229,7 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 func writeQueryError(w http.ResponseWriter, err error) {
-	if err == ErrInvalidQuery || err == ErrInvalidCursor {
+	if err == ErrInvalidQuery || err == ErrInvalidCursor || err == analytics.ErrInvalidQuery {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
 		return
 	}

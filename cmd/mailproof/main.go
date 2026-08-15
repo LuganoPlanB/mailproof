@@ -337,7 +337,7 @@ func resultsAPI(ctx context.Context, args []string) error {
 	}
 	defer db.Close()
 	repo := results.Repository{DB: db, CursorKey: token}
-	server := &http.Server{Addr: *listen, Handler: results.API{Repository: repo, Token: token}.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8 << 10}
+	server := &http.Server{Addr: *listen, Handler: results.API{Repository: repo, Dashboard: analytics.Repository{DB: db}, Token: token}.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8 << 10}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

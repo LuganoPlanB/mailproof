@@ -4,9 +4,11 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/luganoplanb/mailproof/internal/analytics"
 	"github.com/luganoplanb/mailproof/internal/queue"
 )
 
@@ -82,4 +84,65 @@ func TestSummaryRequiresBoundedUTCWindow(t *testing.T) {
 	if _, err := r.Summary(context.Background(), from, from.Add(2*time.Hour), "hour"); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestDashboardRoutesAreAuthenticatedAndBounded(t *testing.T) {
+	r := testRepository(t)
+	token := []byte("abcdefghijklmnopqrstuvwxyz0123456789")
+	h := API{Repository: r, Dashboard: analytics.Repository{DB: r.DB}, Token: token}.Handler()
+	path := "/v1/dashboard/overview?from=2026-01-01T00:00:00Z&to=2026-01-01T01:00:00Z&interval=hour"
+	request := httptest.NewRequest(http.MethodGet, path, nil)
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized || response.Body.String() != "{\"error\":\"unauthorized\"}\n" {
+		t.Fatalf("unauthenticated response: %d %q", response.Code, response.Body.String())
+	}
+	request = httptest.NewRequest(http.MethodGet, path+"&series=run_started&series=run_completed", nil)
+	request.Header.Set("Authorization", "Bearer "+string(token))
+	response = httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("multiplicity response: %d headers=%v", response.Code, response.Header())
+	}
+	request = httptest.NewRequest(http.MethodGet, path+"&dimension=not-a-dimension", nil)
+	request.Header.Set("Authorization", "Bearer "+string(token))
+	response = httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("invalid dimension response: %d", response.Code)
+	}
+	request = httptest.NewRequest(http.MethodGet, strings.Replace(path, "overview", "series", 1)+"&series=run_started&dimension=stage", nil)
+	request.Header.Set("Authorization", "Bearer "+string(token))
+	response = httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("valid dimension response: %d", response.Code)
+	}
+	for _, endpoint := range []string{"overview", "funnel", "series", "operations"} {
+		request = httptest.NewRequest(http.MethodGet, strings.Replace(path, "overview", endpoint, 1), nil)
+		request.Header.Set("Authorization", "Bearer "+string(token))
+		response = httptest.NewRecorder()
+		h.ServeHTTP(response, request)
+		if response.Code != http.StatusOK || response.Header().Get("X-Content-Type-Options") != "nosniff" || !strings.Contains(response.Body.String(), "\"schema_version\":1") || strings.Contains(response.Body.String(), "manifest_path") {
+			t.Fatalf("%s response: %d headers=%v body=%s", endpoint, response.Code, response.Header(), response.Body.String())
+		}
+	}
+}
+
+func FuzzDashboardQueryStrings(f *testing.F) {
+	f.Add("from=2026-01-01T00:00:00Z&to=2026-01-01T01:00:00Z&interval=hour")
+	f.Add("series=run_started&series=run_completed")
+	f.Fuzz(func(t *testing.T, raw string) {
+		r := testRepository(t)
+		token := []byte("abcdefghijklmnopqrstuvwxyz0123456789")
+		h := API{Repository: r, Dashboard: analytics.Repository{DB: r.DB}, Token: token}.Handler()
+		req := httptest.NewRequest(http.MethodGet, "/v1/dashboard/series", nil)
+		req.URL.RawQuery = raw
+		req.Header.Set("Authorization", "Bearer "+string(token))
+		response := httptest.NewRecorder()
+		h.ServeHTTP(response, req)
+		if response.Code != http.StatusOK && response.Code != http.StatusBadRequest && response.Code != http.StatusInternalServerError {
+			t.Fatalf("unexpected status %d", response.Code)
+		}
+	})
 }
