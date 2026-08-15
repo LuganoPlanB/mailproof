@@ -396,7 +396,26 @@ CREATE TABLE metric_rollups (bucket_start INTEGER NOT NULL, granularity TEXT NOT
 CREATE TABLE analytics_projector_lease (singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner TEXT NOT NULL, until INTEGER NOT NULL);
 CREATE TABLE analytics_backup_markers (marker_id INTEGER PRIMARY KEY CHECK(marker_id=1), verified_at INTEGER NOT NULL, manifest_digest TEXT NOT NULL);`}, {9, `CREATE INDEX metric_rollups_dashboard ON metric_rollups(granularity,bucket_start,metric,event_count,source_high_watermark);
 CREATE INDEX runs_dashboard_current ON runs(state);
-CREATE INDEX rejection_work_items_dashboard_current ON rejection_work_items(state);`}}
+CREATE INDEX rejection_work_items_dashboard_current ON rejection_work_items(state);`}, {10, `CREATE TABLE intel_projection_outbox (
+ run_id TEXT PRIMARY KEY REFERENCES runs(run_id), manifest_path TEXT NOT NULL, manifest_digest TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('pending','leased','complete','retryable','terminal')) DEFAULT 'pending',
+ attempts INTEGER NOT NULL DEFAULT 0, not_before INTEGER NOT NULL DEFAULT 0, lease_owner TEXT NOT NULL DEFAULT '', lease_until INTEGER NOT NULL DEFAULT 0,
+ reason_code TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, completed_at INTEGER
+);
+CREATE INDEX intel_projection_outbox_claim ON intel_projection_outbox(state,not_before,lease_until,created_at);
+CREATE TABLE run_indicators (
+ projection_version TEXT NOT NULL, run_id TEXT NOT NULL REFERENCES runs(run_id), indicator_type TEXT NOT NULL, indicator_value TEXT NOT NULL, indicator_digest TEXT NOT NULL, key_id TEXT NOT NULL DEFAULT '', normalization_version TEXT NOT NULL, source_artifact_digest TEXT NOT NULL, created_at INTEGER NOT NULL,
+ PRIMARY KEY(projection_version,run_id,indicator_type,indicator_digest,key_id)
+);
+CREATE TABLE run_grouping_edges (projection_version TEXT NOT NULL, run_id TEXT NOT NULL REFERENCES runs(run_id), strong_grouping_key TEXT NOT NULL, rule_id TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(projection_version,run_id,strong_grouping_key));
+CREATE INDEX run_grouping_edges_component ON run_grouping_edges(projection_version,strong_grouping_key,run_id);
+CREATE TABLE campaign_projections (projection_version TEXT NOT NULL, campaign_id TEXT NOT NULL, component_key TEXT NOT NULL, active INTEGER NOT NULL, superseded_by TEXT NOT NULL DEFAULT '', first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, hit_count INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY(projection_version,campaign_id));
+CREATE TABLE campaign_members (projection_version TEXT NOT NULL, campaign_id TEXT NOT NULL, run_id TEXT NOT NULL REFERENCES runs(run_id), occurred_at INTEGER NOT NULL, PRIMARY KEY(projection_version,campaign_id,run_id));
+CREATE INDEX campaign_members_page ON campaign_members(projection_version,campaign_id,occurred_at DESC,run_id DESC);`}, {11, `CREATE TABLE intel_projected_runs (
+ projection_version TEXT NOT NULL, run_id TEXT NOT NULL REFERENCES runs(run_id), projected_at INTEGER NOT NULL,
+ PRIMARY KEY(projection_version,run_id)
+);
+CREATE INDEX intel_projected_runs_version ON intel_projected_runs(projection_version,run_id);`}}
 	for _, migration := range migrations {
 		version := migration.version
 		var exists int

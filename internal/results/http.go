@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,7 +43,92 @@ func (a API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/dashboard/funnel", a.funnel)
 	mux.HandleFunc("GET /v1/dashboard/series", a.series)
 	mux.HandleFunc("GET /v1/dashboard/operations", a.operations)
+	mux.HandleFunc("GET /v1/campaigns", a.campaigns)
+	mux.HandleFunc("GET /v1/campaigns/", a.campaign)
 	return securityHeaders(auth(a.Token, mux))
+}
+func (a API) campaigns(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if !onlyQuery(q, "status", "projection_version", "cursor", "limit") {
+		writeQueryError(w, ErrInvalidQuery)
+		return
+	}
+	limit, err := pageLimit(q.Get("limit"))
+	if err != nil {
+		writeQueryError(w, err)
+		return
+	}
+	p, err := a.Repository.Campaigns(r.Context(), CampaignFilter{Status: q.Get("status"), ProjectionVersion: q.Get("projection_version"), Cursor: q.Get("cursor"), Limit: limit})
+	if err != nil {
+		writeQueryError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"schema_version": "mailproof.campaigns/v1", "items": p.Items, "next_cursor": p.NextCursor})
+}
+func (a API) campaign(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/campaigns/"), "/")
+	if len(parts) < 1 || parts[0] == "" || len(parts) > 2 {
+		writeQueryError(w, ErrInvalidQuery)
+		return
+	}
+	if len(parts) == 1 {
+		q := r.URL.Query()
+		if !onlyQuery(q, "projection_version") || q.Get("projection_version") == "" {
+			writeQueryError(w, ErrInvalidQuery)
+			return
+		}
+		detail, err := a.Repository.CampaignDetail(r.Context(), parts[0], q.Get("projection_version"))
+		if err != nil {
+			writeQueryError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "mailproof.campaign/v1", "data": detail})
+		return
+	}
+	if parts[1] != "members" {
+		writeQueryError(w, ErrInvalidQuery)
+		return
+	}
+	q := r.URL.Query()
+	if !onlyQuery(q, "projection_version", "cursor", "limit") || q.Get("projection_version") == "" {
+		writeQueryError(w, ErrInvalidQuery)
+		return
+	}
+	limit, err := pageLimit(q.Get("limit"))
+	if err != nil {
+		writeQueryError(w, err)
+		return
+	}
+	p, err := a.Repository.CampaignMembers(r.Context(), parts[0], q.Get("projection_version"), q.Get("cursor"), limit)
+	if err != nil {
+		writeQueryError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"schema_version": "mailproof.campaign-members/v1", "items": p.Items, "next_cursor": p.NextCursor})
+}
+
+func pageLimit(raw string) (int, error) {
+	if raw == "" {
+		return 50, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 || n > MaxPageSize {
+		return 0, ErrInvalidQuery
+	}
+	return n, nil
+}
+
+func onlyQuery(q map[string][]string, names ...string) bool {
+	allowed := make(map[string]bool, len(names))
+	for _, name := range names {
+		allowed[name] = true
+	}
+	for name, values := range q {
+		if !allowed[name] || len(values) != 1 {
+			return false
+		}
+	}
+	return true
 }
 
 func (a API) health(w http.ResponseWriter, r *http.Request) {

@@ -28,6 +28,7 @@ type Input struct {
 	ToolVersions            []string           `json:"tool_versions"`
 	MissingAnalyzers        []string           `json:"missing_analyzers"`
 	Timeline                []TimelineEvent    `json:"timeline"`
+	CampaignEvidence        *CampaignEvidence  `json:"campaign_evidence,omitempty"`
 }
 
 // Publish renders and atomically publishes the three immutable report files.
@@ -101,6 +102,11 @@ func Render(in Input) (map[string][]byte, error) {
 	}
 	if in.AuthContextScope != evidence.LocalIngress && in.AuthContextScope != evidence.Detached {
 		return nil, fmt.Errorf("invalid authentication context scope %q", in.AuthContextScope)
+	}
+	if in.CampaignEvidence != nil {
+		if err := in.CampaignEvidence.Validate(); err != nil {
+			return nil, err
+		}
 	}
 	doc := Document{Schema: Schema, Input: in, SafeNextActions: nextActions(in.Verdict.Category)}
 	jsonBytes, err := json.Marshal(doc)
