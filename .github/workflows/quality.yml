@@ -72,6 +72,9 @@ jobs:
       - name: Validate Rspamd configuration and smoke delivery
         run: |
           docker compose exec -T rspamd rspamadm configtest
+          results_api=$(docker compose ps -q results-api)
+          test -n "${results_api}"
+          test "$(docker inspect --format '{{.State.Health.Status}}' "${results_api}")" = healthy
           bash scripts/smoke.sh --confirm
       - name: Exercise collection and durable worker drain
         run: |

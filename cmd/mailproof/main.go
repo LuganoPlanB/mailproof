@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -10,6 +11,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
+	"net/http"
+	"net/smtp"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -17,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/luganoplanb/mailproof/internal/admission"
 	"github.com/luganoplanb/mailproof/internal/analyzers"
 	"github.com/luganoplanb/mailproof/internal/artifact"
 	"github.com/luganoplanb/mailproof/internal/budget"
@@ -24,6 +29,8 @@ import (
 	"github.com/luganoplanb/mailproof/internal/ingress"
 	"github.com/luganoplanb/mailproof/internal/queue"
 	"github.com/luganoplanb/mailproof/internal/report"
+	"github.com/luganoplanb/mailproof/internal/results"
+	"github.com/luganoplanb/mailproof/internal/submitter"
 )
 
 var version = "dev"
@@ -47,7 +54,7 @@ func exitCode(err error) int {
 }
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: mailproof {version|collect|worker|reporter|status|inspect|replay|bundle|verify-report|redeliver}")
+		return errors.New("usage: mailproof {version|collect|worker|reporter|results-api|status|inspect|replay|bundle|verify-report|redeliver|submitter|admission}")
 	}
 	switch args[0] {
 	case "version":
@@ -58,6 +65,8 @@ func run(ctx context.Context, args []string) error {
 		return worker(ctx, args[1:])
 	case "reporter":
 		return reporter(ctx, args[1:])
+	case "results-api":
+		return resultsAPI(ctx, args[1:])
 	case "status":
 		return status(ctx, args[1:])
 	case "inspect":
@@ -70,8 +79,202 @@ func run(ctx context.Context, args []string) error {
 		return verifyReport(args[1:])
 	case "redeliver":
 		return redeliver(ctx, args[1:])
+	case "submitter":
+		return submitterCommand(ctx, args[1:])
+	case "admission":
+		return admissionCommand(ctx, args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+func resultsAPI(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("results-api", flag.ContinueOnError)
+	state := fs.String("state", "/state/mailproof.sqlite", "SQLite state database")
+	listen := fs.String("listen", ":8080", "internal HTTP listen address")
+	tokenPath := fs.String("token-file", "/runtime/secrets/results-api-token", "0600 bearer token file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	info, err := os.Stat(*tokenPath)
+	if err != nil {
+		return fmt.Errorf("stat API token: %w", err)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return errors.New("API token file must not be group or world readable")
+	}
+	token, err := os.ReadFile(*tokenPath)
+	if err != nil {
+		return fmt.Errorf("read API token: %w", err)
+	}
+	token = []byte(strings.TrimSpace(string(token)))
+	if len(token) < 32 {
+		return errors.New("API token is too short")
+	}
+	db, err := queue.OpenReadOnly(ctx, *state)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	repo := results.Repository{DB: db, CursorKey: token}
+	server := &http.Server{Addr: *listen, Handler: results.API{Repository: repo, Token: token}.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8 << 10}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
+	err = server.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return fmt.Errorf("serve results API: %w", err)
+}
+
+func admissionCommand(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("admission", flag.ContinueOnError)
+	state := fs.String("state", "/state/mailproof.sqlite", "SQLite state database")
+	capabilityKey := fs.String("capability-key", "/runtime/secrets/capability-hmac-key", "capability HMAC key")
+	stampKey := fs.String("stamp-key", "/runtime/secrets/admission-stamp-hmac-key", "admission stamp HMAC key")
+	domain := fs.String("domain", "mailproof.test", "submission address domain")
+	listen := fs.String("listen", ":10040", "Postfix policy listener")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cap, err := os.ReadFile(*capabilityKey)
+	if err != nil {
+		return fmt.Errorf("read capability HMAC key: %w", err)
+	}
+	stamp, err := os.ReadFile(*stampKey)
+	if err != nil {
+		return fmt.Errorf("read admission stamp HMAC key: %w", err)
+	}
+	db, err := queue.Open(ctx, *state)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	listener, err := net.Listen("tcp", *listen)
+	if err != nil {
+		return fmt.Errorf("listen admission policy: %w", err)
+	}
+	defer listener.Close()
+	return (admission.Server{Service: admission.Service{DB: db, CapabilityKey: cap, StampKey: stamp, Domain: *domain, Resolver: admission.DNSResolver{Server: "unbound:53", Timeout: 2 * time.Second}}, MaxConnections: 32}).Serve(ctx, listener)
+}
+
+// postfixMailer is the concrete adapter; enrollment itself only knows Mailer.
+type postfixMailer struct{ address string }
+
+func (m postfixMailer) Send(_ context.Context, to, subject, body string) error {
+	sum := sha256.Sum256([]byte(to + "\x00" + body))
+	message := "To: " + to + "\r\nSubject: " + subject + "\r\nMessage-ID: <mailproof-enrollment-" + hex.EncodeToString(sum[:16]) + "@mailproof>\r\n\r\n" + body
+	return smtp.SendMail(m.address, nil, "", []string{to}, []byte(message))
+}
+
+func submitterCommand(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: mailproof submitter {challenge|activate|list|revoke|rotate}")
+	}
+	fs := flag.NewFlagSet("submitter "+args[0], flag.ContinueOnError)
+	state := fs.String("state", "/state/mailproof.sqlite", "SQLite state database")
+	key := fs.String("capability-key", "/runtime/secrets/capability-hmac-key", "capability HMAC key")
+	keyID := fs.String("capability-key-id", "v1", "capability HMAC key identifier")
+	domain := fs.String("domain", "mailproof.test", "submission address domain")
+	smtpAddress := fs.String("smtp-addr", "postfix:25", "internal Postfix SMTP address")
+	email := fs.String("email", "", "submitter mailbox address")
+	code := fs.String("code", "", "mailbox challenge code")
+	id := fs.String("id", "", "submitter ID")
+	dryRun := fs.Bool("dry-run", false, "show action without changing state")
+	confirm := fs.Bool("confirm", false, "perform state-changing action")
+	jsonFlag := fs.Bool("json", false, "emit JSON")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if !*jsonFlag {
+		return errors.New("submitter commands require --json")
+	}
+	if args[0] != "list" && *dryRun == *confirm {
+		return errors.New("state-changing submitter commands require exactly one of --dry-run or --confirm")
+	}
+	if args[0] == "list" && (*dryRun || *confirm) {
+		return errors.New("submitter list does not accept --dry-run or --confirm")
+	}
+	encode := func(v any) error { return json.NewEncoder(os.Stdout).Encode(v) }
+	if *dryRun {
+		switch args[0] {
+		case "challenge":
+			if _, err := submitter.CanonicalAddress(*email); err != nil {
+				return err
+			}
+			return encode(map[string]any{"email": *email, "would_challenge": true})
+		case "activate":
+			if _, err := submitter.CanonicalAddress(*email); err != nil || *code == "" {
+				return errors.New("submitter activate requires --email and --code")
+			}
+			return encode(map[string]any{"email": *email, "would_activate": true})
+		case "revoke", "rotate":
+			if !safeID(*id) {
+				return fmt.Errorf("submitter %s requires a valid --id", args[0])
+			}
+			return encode(map[string]any{"submitter_id": *id, "would_" + args[0]: true})
+		default:
+			return fmt.Errorf("unknown submitter command %q", args[0])
+		}
+	}
+	keyBytes, err := os.ReadFile(*key)
+	if err != nil {
+		return fmt.Errorf("read capability HMAC key: %w", err)
+	}
+	db, err := queue.Open(ctx, *state)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	svc := submitter.Service{DB: db, Mailer: postfixMailer{address: *smtpAddress}, CapabilityKey: keyBytes, CapabilityKeyID: *keyID, Domain: *domain}
+	switch args[0] {
+	case "challenge":
+		if *email == "" {
+			return errors.New("submitter challenge requires --email")
+		}
+		challenge, err := svc.Challenge(ctx, *email)
+		if err != nil {
+			return err
+		}
+		return encode(map[string]any{"challenge_id": challenge.ID, "submitter_id": challenge.SubmitterID, "expires_at": challenge.ExpiresAt})
+	case "activate":
+		if *email == "" || *code == "" {
+			return errors.New("submitter activate requires --email and --code")
+		}
+		a, err := svc.Activate(ctx, *email, *code)
+		if err != nil {
+			return err
+		}
+		return encode(map[string]any{"submitter": a.Submitter, "submission_address": a.SubmissionAddress})
+	case "list":
+		items, err := svc.List(ctx)
+		if err != nil {
+			return err
+		}
+		return encode(items)
+	case "revoke":
+		if !safeID(*id) {
+			return errors.New("submitter revoke requires a valid --id")
+		}
+		if err := svc.Revoke(ctx, *id); err != nil {
+			return err
+		}
+		return encode(map[string]any{"submitter_id": *id, "status": "revoked"})
+	case "rotate":
+		if !safeID(*id) {
+			return errors.New("submitter rotate requires a valid --id")
+		}
+		a, err := svc.Rotate(ctx, *id)
+		if err != nil {
+			return err
+		}
+		return encode(map[string]any{"submitter_id": *id, "submission_address": a})
+	default:
+		return fmt.Errorf("unknown submitter command %q", args[0])
 	}
 }
 
@@ -188,6 +391,8 @@ func collect(ctx context.Context, args []string) error {
 	state := fs.String("state", "/state/mailproof.sqlite", "SQLite state database")
 	logs := fs.String("postfix-log", "", "restricted Postfix log file")
 	registry := fs.String("token-registry", "", "token registry JSON file")
+	stampKeyPath := fs.String("admission-stamp-key", "/runtime/secrets/admission-stamp-hmac-key", "admission stamp HMAC key")
+	subjectAllowlistPath := fs.String("subject-domain-allowlist", "", "newline-delimited selected subject domain allowlist")
 	once := fs.Bool("once", false, "run one sweep")
 	watch := fs.Bool("watch", false, "poll every two seconds")
 	maxJobs := fs.Int("max-jobs", 0, "maximum collection sweeps")
@@ -221,6 +426,10 @@ func collect(ctx context.Context, args []string) error {
 		return err
 	}
 	defer db.Close()
+	subjectAllowlist, err := readAllowlist(*subjectAllowlistPath)
+	if err != nil {
+		return err
+	}
 	ok, err := queue.AcquireCollectorLease(ctx, db, owner, time.Now(), 30*time.Second)
 	if err != nil {
 		return err
@@ -238,7 +447,7 @@ func collect(ctx context.Context, args []string) error {
 		if !ok {
 			return errors.New("collector lease lost")
 		}
-		if err := collectOnce(ctx, db, *source, *artifacts, *logs, *registry); err != nil {
+		if err := collectOnce(ctx, db, *source, *artifacts, *logs, *registry, *stampKeyPath, subjectAllowlist); err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return emitStatus("collect", "stopped", sweeps)
 			}
@@ -258,7 +467,7 @@ func collect(ctx context.Context, args []string) error {
 		}
 	}
 }
-func collectOnce(ctx context.Context, db *sql.DB, source, artifacts, logPath, registryPath string) error {
+func collectOnce(ctx context.Context, db *sql.DB, source, artifacts, logPath, registryPath, stampKeyPath string, subjectAllowlist []string) error {
 	entries, err := os.ReadDir(source)
 	if err != nil {
 		return fmt.Errorf("read Maildir: %w", err)
@@ -291,15 +500,117 @@ func collectOnce(ctx context.Context, db *sql.DB, source, artifacts, logPath, re
 		if err := publishIngress(artifacts, deliveryID, digest, entry.Name(), correlation); err != nil {
 			return err
 		}
+		stampKey, keyErr := os.ReadFile(stampKeyPath)
+		if keyErr != nil {
+			return fmt.Errorf("read admission stamp HMAC key: %w", keyErr)
+		}
+		admissionContext := admission.Service{DB: db, StampKey: stampKey}
+		decision, admissionErr := admissionContext.ConsumeStamp(ctx, headerPrefix(message), correlation.QueueID)
+		if admissionErr != nil {
+			decisionID, idErr := randomID()
+			if idErr != nil {
+				return idErr
+			}
+			if err := queue.RecordRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, "admission_stamp_invalid", time.Now()); err != nil {
+				return err
+			}
+			continue
+		}
+		destination, destinationErr := queue.SnapshotReportDestination(ctx, db, decision.SubmitterID)
+		if destinationErr != nil {
+			return fmt.Errorf("snapshot admitted delivery destination: %w", destinationErr)
+		}
+		wrapperFrom, wrapperErr := admission.SelectedSubjectFrom(message)
+		if wrapperErr != nil || wrapperFrom != decision.Envelope {
+			decisionID, idErr := randomID()
+			if idErr != nil {
+				return idErr
+			}
+			if err := queue.RecordAdmittedRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, "wrapper_sender_invalid", destination, time.Now()); err != nil {
+				return err
+			}
+			if err := queue.EnqueueVerifiedRejectionNotification(ctx, db, decision.ID, deliveryID, decisionID+"-notify", time.Now()); err != nil {
+				return err
+			}
+			continue
+		}
+		sealed, readErr := os.ReadFile(filepath.Join(artifacts, "messages", digest+".eml"))
+		if readErr != nil {
+			return fmt.Errorf("read sealed delivery: %w", readErr)
+		}
+		selection, selectionErr := evidence.SelectTopLevelRFC822(sealed, digest, artifacts)
+		if selectionErr != nil {
+			return fmt.Errorf("select subject: %w", selectionErr)
+		}
+		if selection.SubjectDigest == "" && selection.SelectionError == "" {
+			selection.SubjectDigest = digest
+		}
+		if selection.SelectionError != "" {
+			decisionID, idErr := randomID()
+			if idErr != nil {
+				return idErr
+			}
+			if err := queue.RecordAdmittedRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, "selected_subject_ambiguous", destination, time.Now()); err != nil {
+				return err
+			}
+			continue
+		}
+		selected, readErr := os.ReadFile(filepath.Join(artifacts, "messages", selection.SubjectDigest+".eml"))
+		if readErr != nil {
+			return fmt.Errorf("read sealed selected subject: %w", readErr)
+		}
+		selectedFrom, selectedErr := admission.SelectedSubjectFrom(selected)
+		_, allowed := admission.SelectedSubjectAllowed(selectedFrom, subjectAllowlist)
+		if selectedErr != nil || !allowed {
+			decisionID, idErr := randomID()
+			if idErr != nil {
+				return idErr
+			}
+			if err := queue.RecordAdmittedRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, "selected_subject_sender_denied", destination, time.Now()); err != nil {
+				return err
+			}
+			if err := queue.EnqueueVerifiedRejectionNotification(ctx, db, decision.ID, deliveryID, decisionID+"-notify", time.Now()); err != nil {
+				return err
+			}
+			continue
+		}
 		runID, err := randomID()
 		if err != nil {
 			return err
 		}
-		if err := queue.EnqueueCollection(ctx, db, deliveryID, digest, sourceKey, runID, time.Now()); err != nil {
+		if err := queue.EnqueueAdmittedCollection(ctx, db, deliveryID, digest, sourceKey, runID, destination, time.Now()); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func readAllowlist(path string) ([]string, error) {
+	if path == "" {
+		return []string{}, nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read selected subject allowlist: %w", err)
+	}
+	values := []string{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
+			values = append(values, line)
+		}
+	}
+	return values, nil
+}
+
+func headerPrefix(message []byte) []string {
+	lines := []string{}
+	for _, line := range strings.Split(string(message), "\n") {
+		if line == "\r" || line == "" {
+			break
+		}
+		lines = append(lines, line)
+	}
+	return lines
 }
 
 func readLines(path string) []string {
@@ -593,25 +904,50 @@ func reportRun(ctx context.Context, db *sql.DB, run *queue.Run, root, keyPath, r
 	if err := report.SignAndPublish(root, run.ID, manifest, key); err != nil {
 		return "", false, err
 	}
-	recipientBytes, err := os.ReadFile(recipientPath)
+	// The projection is deliberately written only after a signed bundle exists
+	// and verifies against the public half of the reporter key.
+	bundleDir := filepath.Join(root, "runs", run.ID, "report")
+	if verification := report.VerifyBundle(bundleDir, []ed25519.PublicKey{key.Public().(ed25519.PublicKey)}); !verification.Valid {
+		return "", false, errors.New("verify signed report bundle")
+	}
+	manifestBytes, err := os.ReadFile(filepath.Join(bundleDir, "manifest.json"))
 	if err != nil {
 		return "", false, err
 	}
-	recipient := strings.TrimSpace(string(recipientBytes))
-	if recipient == "" {
+	if err := results.InsertRecord(ctx, db, results.Record{RunID: run.ID, DeliveryID: run.DeliveryID, OccurredAt: time.Now().UTC(), Verdict: string(verdict.Category), PolicyVersion: "v1", SchemaVersion: "mailproof.result/v1", AuthScope: string(evidence.LocalIngress), SelectedSubjectStatus: "selected", UnavailableAnalyzers: len(verdict.Unavailable), RiskSummary: verdict.Technical, CategorySummary: verdict.Behavior, ManifestDigest: evidence.Digest(manifestBytes), ManifestPath: filepath.Join("runs", run.ID, "report", "manifest.json"), SourceArtifactDigests: evidence.Digest(documents["report.json"])}); err != nil {
+		return "", false, err
+	}
+	_ = recipientPath // retained for CLI compatibility; it is never a routing fallback.
+	destination, err := queue.ReportDestinationForRun(ctx, db, run.ID)
+	if errors.Is(err, queue.ErrNoReportDestination) {
 		return queue.ReplySuppressed, false, nil
 	}
-	manifestBytes, err := os.ReadFile(filepath.Join(root, "runs", run.ID, "report", "manifest.json"))
 	if err != nil {
 		return "", false, err
 	}
+	attemptID, err := queue.BeginReportAttempt(ctx, db, run.ID, destination, time.Now())
+	if err != nil {
+		return "", false, err
+	}
+	// manifestBytes was just verified before the immutable projection was made.
 	signature, err := os.ReadFile(filepath.Join(root, "runs", run.ID, "report", "manifest.sig"))
 	if err != nil {
+		_ = queue.FinishReportAttempt(ctx, db, attemptID, "failed", "smtp", time.Now())
 		return "", false, err
 	}
-	unknown, err := report.Submit(ctx, smtpAddress, report.Reply{EnvelopeFrom: "", Recipient: recipient, DeliveryID: run.DeliveryID, Manifest: manifestBytes, Signature: signature, ReportText: documents["report.txt"], ReportHTML: documents["report.html"], ReportJSON: documents["report.json"]})
+	unknown, err := report.Submit(ctx, smtpAddress, report.Reply{EnvelopeFrom: "", Recipient: destination.ReplyAddress, DeliveryID: run.DeliveryID, Manifest: manifestBytes, Signature: signature, ReportText: documents["report.txt"], ReportHTML: documents["report.html"], ReportJSON: documents["report.json"]})
 	if err != nil {
+		outcome := "failed"
+		if unknown {
+			outcome = "unknown"
+		}
+		if finishErr := queue.FinishReportAttempt(ctx, db, attemptID, outcome, "smtp", time.Now()); finishErr != nil {
+			return "", unknown, finishErr
+		}
 		return "", unknown, err
+	}
+	if err := queue.FinishReportAttempt(ctx, db, attemptID, "accepted", "", time.Now()); err != nil {
+		return "", false, err
 	}
 	return queue.Complete, false, nil
 }

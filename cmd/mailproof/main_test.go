@@ -22,6 +22,18 @@ func TestStatusRequiresJSON(t *testing.T) {
 		t.Fatal("status accepted missing --json")
 	}
 }
+
+func TestSubmitterDryRunDoesNotRequireStateOrSecrets(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "missing.sqlite")
+	key := filepath.Join(dir, "missing-key")
+	if err := run(context.Background(), []string{"submitter", "challenge", "--email", "operator@example.org", "--state", state, "--capability-key", key, "--dry-run", "--json"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(state); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dry-run created state: %v", err)
+	}
+}
 func TestCollectRejectsConflictingModes(t *testing.T) {
 	if err := run(context.Background(), []string{"collect", "--once", "--watch"}); err == nil {
 		t.Fatal("collect accepted conflicting modes")
@@ -51,7 +63,11 @@ func TestCollectWatchFindsMailArrivingAfterFirstSweep(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	state := filepath.Join(dir, "state.sqlite")
-	if err := run(ctx, []string{"collect", "--watch", "--max-jobs", "2", "--source", source, "--artifacts", filepath.Join(dir, "artifacts"), "--state", state}); err != nil {
+	stampKey := filepath.Join(dir, "admission-stamp-key")
+	if err := os.WriteFile(stampKey, []byte("01234567890123456789012345678901"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(ctx, []string{"collect", "--watch", "--max-jobs", "2", "--source", source, "--artifacts", filepath.Join(dir, "artifacts"), "--state", state, "--admission-stamp-key", stampKey}); err != nil {
 		t.Fatal(err)
 	}
 	db, err := queue.Open(context.Background(), state)

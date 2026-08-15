@@ -23,6 +23,7 @@ services:
     environment:
       MAILPROOF_REPORT_RECIPIENT: ${MAILPROOF_REPORT_RECIPIENT:-operator@example.org}
       MAILPROOF_VERIFY_RECIPIENT: ${MAILPROOF_VERIFY_RECIPIENT:-verify@mailproof.test}
+      MAILPROOF_SUBJECT_SENDER_DOMAIN_ALLOWLIST: ${MAILPROOF_SUBJECT_SENDER_DOMAIN_ALLOWLIST:-}
       MAILPROOF_CLAMAV_PROVISION: ${MAILPROOF_CLAMAV_PROVISION:-none}
     volumes:
       - ./containers/init/entrypoint.sh:/entrypoint.sh:ro
@@ -41,6 +42,7 @@ services:
     depends_on:
       init: {condition: service_completed_successfully}
       dovecot: {condition: service_healthy}
+      admission: {condition: service_started}
     ports: ["${MAILPROOF_SMTP_PORT:-2525}:25"]
     networks: [public, mail, report]
     volumes:
@@ -51,6 +53,26 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/25"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    logging: *logging
+
+  # The only SMTP-time application component. It is confined to the mail
+  # network and has neither delivered mail nor analyzer/scanner access.
+  admission:
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-app"
+    command: ["admission"]
+    depends_on: {init: {condition: service_completed_successfully}}
+    networks: [mail]
+    volumes:
+      - state:/state
+      - runtime:/runtime:ro
+    <<: [*hardening, *resources]
+    tmpfs: [/tmp]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /state/mailproof.sqlite"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -75,7 +97,7 @@ services:
 
   collector:
     image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-app"
-    command: ["collect", "--watch", "--postfix-log", "/postfix-log/ingress.log", "--token-registry", "/runtime/secrets/token-registry.json"]
+    command: ["collect", "--watch", "--postfix-log", "/postfix-log/ingress.log", "--token-registry", "/runtime/secrets/token-registry.json", "--admission-stamp-key", "/runtime/secrets/admission-stamp-hmac-key", "--subject-domain-allowlist", "/runtime/config/subject-sender-domain-allowlist"]
     depends_on: {dovecot: {condition: service_healthy}}
     networks: [mail]
     volumes:
@@ -127,6 +149,27 @@ services:
     <<: [*hardening, *resources]
     tmpfs: [/tmp]
     restart: unless-stopped
+    logging: *logging
+
+  # Dashboard consumers join this internal-only network; no host port is
+  # published and the API receives only a read-only state volume and token.
+  results-api:
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-app"
+    command: ["results-api"]
+    depends_on: {init: {condition: service_completed_successfully}}
+    networks: [analytics]
+    volumes:
+      - state:/state:ro
+      - artifacts:/artifacts:ro
+      - runtime:/runtime:ro
+    <<: [*hardening, *resources]
+    tmpfs: [/tmp]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -r /state/mailproof.sqlite && test -r /runtime/secrets/results-api-token"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
     logging: *logging
 
   smoke:
@@ -247,6 +290,7 @@ networks:
   analyzer: {internal: true}
   scanner: {internal: true}
   report: {internal: true}
+  analytics: {internal: true}
 
 volumes:
   runtime: {}
