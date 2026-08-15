@@ -63,7 +63,11 @@ func TestCollectWatchFindsMailArrivingAfterFirstSweep(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	state := filepath.Join(dir, "state.sqlite")
-	if err := run(ctx, []string{"collect", "--watch", "--max-jobs", "2", "--source", source, "--artifacts", filepath.Join(dir, "artifacts"), "--state", state}); err != nil {
+	stampKey := filepath.Join(dir, "admission-stamp-key")
+	if err := os.WriteFile(stampKey, []byte("01234567890123456789012345678901"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(ctx, []string{"collect", "--watch", "--max-jobs", "2", "--source", source, "--artifacts", filepath.Join(dir, "artifacts"), "--state", state, "--admission-stamp-key", stampKey}); err != nil {
 		t.Fatal(err)
 	}
 	db, err := queue.Open(context.Background(), state)

@@ -31,6 +31,9 @@ services:
         DEBIAN_SNAPSHOT: ${DEBIAN_SNAPSHOT:-20260814T000000Z}
       labels: *image-labels
 
+  admission:
+    build: *mailproof-build
+
   dovecot:
     build:
       context: .

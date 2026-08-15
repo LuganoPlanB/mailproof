@@ -48,6 +48,39 @@ func EnqueueCollection(ctx context.Context, db *sql.DB, deliveryID, digest, sour
 	return nil
 }
 
+// RecordRejectedCollection preserves the sealed delivery and its auditable
+// post-DATA rejection without creating an analyzer run.
+func RecordRejectedCollection(ctx context.Context, db *sql.DB, deliveryID, digest, sourceKey, decisionID, reason string, now time.Time) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin rejected collection: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO deliveries(delivery_id,message_digest,source_key,collected_at) VALUES(?,?,?,?) ON CONFLICT(source_key) DO NOTHING`, deliveryID, digest, sourceKey, now.Unix()); err != nil {
+		return fmt.Errorf("insert rejected delivery: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO submission_decisions(decision_id,envelope_sender,recipient,peer_ip,helo,spf_outcome,stage,reason_code,policy_version,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, decisionID, "", "", "", "", "", "post_data", reason, "v1", now.Unix()); err != nil {
+		return fmt.Errorf("insert post-data rejection: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO rejection_work_items(work_id,decision_id,delivery_id,kind,created_at) VALUES(?,?,?,'notarize',?)`, decisionID+"-notarize", decisionID, deliveryID, now.Unix()); err != nil {
+		return fmt.Errorf("enqueue rejection notarization: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit rejected collection: %w", err)
+	}
+	return nil
+}
+
+// EnqueueVerifiedRejectionNotification makes a reply eligible only when the
+// consumed admission decision already identifies a verified submitter.
+func EnqueueVerifiedRejectionNotification(ctx context.Context, db *sql.DB, decisionID, deliveryID, workID string, now time.Time) error {
+	_, err := db.ExecContext(ctx, `INSERT INTO rejection_work_items(work_id,decision_id,delivery_id,kind,created_at) VALUES(?,?,?,'notify_verified_forwarder',?)`, workID, decisionID, deliveryID, now.Unix())
+	if err != nil {
+		return fmt.Errorf("enqueue verified rejection notification: %w", err)
+	}
+	return nil
+}
+
 func Collected(ctx context.Context, db *sql.DB, sourceKey string) (bool, error) {
 	var n int
 	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM deliveries WHERE source_key=?", sourceKey).Scan(&n); err != nil {
@@ -112,7 +145,23 @@ CREATE TABLE IF NOT EXISTS deliveries (
  key_id TEXT NOT NULL, activated_at INTEGER NOT NULL, revoked_at INTEGER,
  UNIQUE(key_id, digest));
 
- CREATE UNIQUE INDEX submission_capabilities_one_active ON submission_capabilities(submitter_id) WHERE revoked_at IS NULL;`}}
+ CREATE UNIQUE INDEX submission_capabilities_one_active ON submission_capabilities(submitter_id) WHERE revoked_at IS NULL;`}, {3, `CREATE TABLE submission_decisions (
+ decision_id TEXT PRIMARY KEY, submitter_id TEXT REFERENCES submitters(submitter_id), capability_digest BLOB,
+ envelope_sender TEXT NOT NULL, recipient TEXT NOT NULL, peer_ip TEXT NOT NULL, helo TEXT NOT NULL,
+ spf_outcome TEXT NOT NULL, stage TEXT NOT NULL, reason_code TEXT NOT NULL, policy_version TEXT NOT NULL,
+ queue_id TEXT, stamp_mac BLOB, expires_at INTEGER, consumed_at INTEGER, created_at INTEGER NOT NULL
+);
+CREATE INDEX submission_decisions_expiry ON submission_decisions(expires_at, consumed_at);
+CREATE TABLE admission_events (
+ decision_id TEXT PRIMARY KEY REFERENCES submission_decisions(decision_id), submitter_id TEXT NOT NULL REFERENCES submitters(submitter_id), admitted_at INTEGER NOT NULL
+);
+CREATE INDEX admission_events_window ON admission_events(submitter_id, admitted_at);`}, {4, `CREATE TABLE rejection_work_items (
+ work_id TEXT PRIMARY KEY, decision_id TEXT NOT NULL REFERENCES submission_decisions(decision_id),
+ delivery_id TEXT NOT NULL REFERENCES deliveries(delivery_id), kind TEXT NOT NULL CHECK(kind IN ('notarize','notify_verified_forwarder')),
+ state TEXT NOT NULL CHECK(state IN ('pending','leased','complete','dead')) DEFAULT 'pending',
+ created_at INTEGER NOT NULL, lease_owner TEXT, lease_until INTEGER, last_error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX rejection_work_items_claim ON rejection_work_items(state, lease_until, created_at);`}}
 	for _, migration := range migrations {
 		version := migration.version
 		var exists int
