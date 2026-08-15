@@ -1,0 +1,9 @@
+{
+  "private": true,
+  "devDependencies": {
+    "@axe-core/playwright": "4.10.2",
+    "@playwright/test": "1.52.0"
+  },
+  "scripts": { "test": "playwright test" },
+  "allowScripts": ["@playwright/test", "playwright"]
+}

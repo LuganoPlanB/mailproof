@@ -23,6 +23,20 @@ func TestStatusRequiresJSON(t *testing.T) {
 	}
 }
 
+func TestDashboardLoopbackHost(t *testing.T) {
+	for _, tc := range []struct {
+		host string
+		want bool
+	}{
+		{"localhost", true}, {"127.0.0.1", true}, {"127.7.4.2", true}, {"::1", true},
+		{"0.0.0.0", false}, {"::", false}, {"dashboard.example.test", false}, {"192.0.2.1", false},
+	} {
+		if got := dashboardLoopbackHost(tc.host); got != tc.want {
+			t.Errorf("%s = %t", tc.host, got)
+		}
+	}
+}
+
 func TestIntelRebuildAndActivationRequireExplicitConfirm(t *testing.T) {
 	state := filepath.Join(t.TempDir(), "state.sqlite")
 	if err := run(context.Background(), []string{"intel", "rebuild", "--state", state, "--dry-run"}); err != nil {
