@@ -30,6 +30,15 @@
   [ "$status" -eq 0 ]
 }
 
+@test "daemon healthchecks use tools present in their images" {
+  run docker compose --env-file config/versions.env config --format json
+  [ "$status" -eq 0 ]
+  config=$output
+
+  run python3 -c 'import json, sys; services=json.loads(sys.argv[1])["services"]; assert "/dev/tcp/127.0.0.1/25" in services["postfix"]["healthcheck"]["test"][-1]; assert "/dev/tcp/127.0.0.1/3310" in services["clamav"]["healthcheck"]["test"][-1]; assert "nPING" in services["clamav"]["healthcheck"]["test"][-1]' "$config"
+  [ "$status" -eq 0 ]
+}
+
 @test "backup and restore runbooks expose dry-run-first commands" {
   run scripts/backup.sh --dry-run --output /tmp/mailproof-backup
   [ "$status" -eq 0 ]

@@ -69,6 +69,9 @@ before changing this path or the meaning of evidence.
 - ClamAV is the resource exception: its configurable default is 4 GiB and must
   remain at least 3 GiB for current signature databases. Do not apply the shared
   512 MiB service limit to `clamav`.
+- Keep healthchecks within the commands actually installed by each minimal
+  image. Postfix and ClamAV intentionally use Bash `/dev/tcp`; their images do
+  not install `nc` or `clamdscan`.
 - Add focused tests beside changed Go packages. Update Bats/contract tests for
   observable shell or Compose changes. Update an ADR when changing an accepted
   evidence or capability decision.
