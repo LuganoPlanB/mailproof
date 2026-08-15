@@ -468,13 +468,17 @@ func collectOnce(ctx context.Context, db *sql.DB, source, artifacts, logPath, re
 			}
 			continue
 		}
+		destination, destinationErr := queue.SnapshotReportDestination(ctx, db, decision.SubmitterID)
+		if destinationErr != nil {
+			return fmt.Errorf("snapshot admitted delivery destination: %w", destinationErr)
+		}
 		wrapperFrom, wrapperErr := admission.SelectedSubjectFrom(message)
 		if wrapperErr != nil || wrapperFrom != decision.Envelope {
 			decisionID, idErr := randomID()
 			if idErr != nil {
 				return idErr
 			}
-			if err := queue.RecordRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, "wrapper_sender_invalid", time.Now()); err != nil {
+			if err := queue.RecordAdmittedRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, "wrapper_sender_invalid", destination, time.Now()); err != nil {
 				return err
 			}
 			if err := queue.EnqueueVerifiedRejectionNotification(ctx, db, decision.ID, deliveryID, decisionID+"-notify", time.Now()); err != nil {
@@ -498,7 +502,7 @@ func collectOnce(ctx context.Context, db *sql.DB, source, artifacts, logPath, re
 			if idErr != nil {
 				return idErr
 			}
-			if err := queue.RecordRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, "selected_subject_ambiguous", time.Now()); err != nil {
+			if err := queue.RecordAdmittedRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, "selected_subject_ambiguous", destination, time.Now()); err != nil {
 				return err
 			}
 			continue
@@ -514,7 +518,7 @@ func collectOnce(ctx context.Context, db *sql.DB, source, artifacts, logPath, re
 			if idErr != nil {
 				return idErr
 			}
-			if err := queue.RecordRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, "selected_subject_sender_denied", time.Now()); err != nil {
+			if err := queue.RecordAdmittedRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, "selected_subject_sender_denied", destination, time.Now()); err != nil {
 				return err
 			}
 			if err := queue.EnqueueVerifiedRejectionNotification(ctx, db, decision.ID, deliveryID, decisionID+"-notify", time.Now()); err != nil {
@@ -526,7 +530,7 @@ func collectOnce(ctx context.Context, db *sql.DB, source, artifacts, logPath, re
 		if err != nil {
 			return err
 		}
-		if err := queue.EnqueueCollection(ctx, db, deliveryID, digest, sourceKey, runID, time.Now()); err != nil {
+		if err := queue.EnqueueAdmittedCollection(ctx, db, deliveryID, digest, sourceKey, runID, destination, time.Now()); err != nil {
 			return err
 		}
 	}
@@ -852,25 +856,41 @@ func reportRun(ctx context.Context, db *sql.DB, run *queue.Run, root, keyPath, r
 	if err := report.SignAndPublish(root, run.ID, manifest, key); err != nil {
 		return "", false, err
 	}
-	recipientBytes, err := os.ReadFile(recipientPath)
+	_ = recipientPath // retained for CLI compatibility; it is never a routing fallback.
+	destination, err := queue.ReportDestinationForRun(ctx, db, run.ID)
+	if errors.Is(err, queue.ErrNoReportDestination) {
+		return queue.ReplySuppressed, false, nil
+	}
 	if err != nil {
 		return "", false, err
 	}
-	recipient := strings.TrimSpace(string(recipientBytes))
-	if recipient == "" {
-		return queue.ReplySuppressed, false, nil
+	attemptID, err := queue.BeginReportAttempt(ctx, db, run.ID, destination, time.Now())
+	if err != nil {
+		return "", false, err
 	}
 	manifestBytes, err := os.ReadFile(filepath.Join(root, "runs", run.ID, "report", "manifest.json"))
 	if err != nil {
+		_ = queue.FinishReportAttempt(ctx, db, attemptID, "failed", "smtp", time.Now())
 		return "", false, err
 	}
 	signature, err := os.ReadFile(filepath.Join(root, "runs", run.ID, "report", "manifest.sig"))
 	if err != nil {
+		_ = queue.FinishReportAttempt(ctx, db, attemptID, "failed", "smtp", time.Now())
 		return "", false, err
 	}
-	unknown, err := report.Submit(ctx, smtpAddress, report.Reply{EnvelopeFrom: "", Recipient: recipient, DeliveryID: run.DeliveryID, Manifest: manifestBytes, Signature: signature, ReportText: documents["report.txt"], ReportHTML: documents["report.html"], ReportJSON: documents["report.json"]})
+	unknown, err := report.Submit(ctx, smtpAddress, report.Reply{EnvelopeFrom: "", Recipient: destination.ReplyAddress, DeliveryID: run.DeliveryID, Manifest: manifestBytes, Signature: signature, ReportText: documents["report.txt"], ReportHTML: documents["report.html"], ReportJSON: documents["report.json"]})
 	if err != nil {
+		outcome := "failed"
+		if unknown {
+			outcome = "unknown"
+		}
+		if finishErr := queue.FinishReportAttempt(ctx, db, attemptID, outcome, "smtp", time.Now()); finishErr != nil {
+			return "", unknown, finishErr
+		}
 		return "", unknown, err
+	}
+	if err := queue.FinishReportAttempt(ctx, db, attemptID, "accepted", "", time.Now()); err != nil {
+		return "", false, err
 	}
 	return queue.Complete, false, nil
 }
