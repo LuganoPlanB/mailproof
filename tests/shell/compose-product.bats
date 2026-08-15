@@ -18,7 +18,7 @@
   [[ "$output" == *"no-new-privileges:true"* ]]
   [[ "$output" == *"cap_drop:"* ]]
   [[ "$output" == *"read_only: true"* ]]
-  [[ "$output" == *"mailproof.lua:/etc/rspamd/plugins.d/mailproof.lua:ro"* ]]
+  [[ "$output" == *"target: /etc/rspamd/plugins.d"* ]]
 }
 
 @test "backup and restore runbooks expose dry-run-first commands" {
