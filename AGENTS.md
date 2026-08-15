@@ -72,6 +72,8 @@ before changing this path or the meaning of evidence.
 - Keep healthchecks within the commands actually installed by each minimal
   image. Postfix, Unbound, and ClamAV intentionally use Bash `/dev/tcp`; the
   minimal images do not install the previous `nc` or `clamdscan` probes.
+- In shell orchestration, query container health with `docker compose ps -q`
+  plus `docker inspect --format`; do not scrape Compose JSON formatting.
 - Unbound requires the pinned `dns-root-data` package and an installed
   `/var/lib/unbound/root.key` for the Debian default DNSSEC configuration. Its
   bootstrap capabilities are needed to bind port 53, create runtime files, and

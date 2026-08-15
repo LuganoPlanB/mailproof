@@ -47,10 +47,18 @@ diagnostics() {
 }
 trap diagnostics EXIT
 
+service_healthy() {
+	local service=$1 container_id health
+	container_id=$(docker compose ps -q "${service}") || return 1
+	[[ -n ${container_id} ]] || return 1
+	health=$(docker inspect --format '{{.State.Health.Status}}' "${container_id}") || return 1
+	[[ ${health} == healthy ]]
+}
+
 for attempt in $(seq 1 30); do
-	compose_state=$(docker compose ps --format json 2>/dev/null || true)
-	if printf '%s' "${compose_state}" | grep -q '"Service":"postfix".*"Health":"healthy"' &&
-		printf '%s' "${compose_state}" | grep -q '"Service":"dovecot".*"Health":"healthy"'; then
+	# service_healthy handles each command failure explicitly.
+	# shellcheck disable=SC2310
+	if service_healthy postfix && service_healthy dovecot; then
 		break
 	fi
 	((attempt < 30)) || {
