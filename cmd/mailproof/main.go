@@ -28,6 +28,7 @@ import (
 	"github.com/luganoplanb/mailproof/internal/budget"
 	"github.com/luganoplanb/mailproof/internal/evidence"
 	"github.com/luganoplanb/mailproof/internal/ingress"
+	"github.com/luganoplanb/mailproof/internal/intel"
 	"github.com/luganoplanb/mailproof/internal/queue"
 	"github.com/luganoplanb/mailproof/internal/report"
 	"github.com/luganoplanb/mailproof/internal/results"
@@ -56,7 +57,7 @@ func exitCode(err error) int {
 }
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: mailproof {version|collect|worker|reporter|analytics-projector|analytics|results-api|status|inspect|replay|bundle|verify-report|redeliver|submitter|admission}")
+		return errors.New("usage: mailproof {version|collect|worker|reporter|intel-projector|intel|analytics-projector|analytics|results-api|status|inspect|replay|bundle|verify-report|redeliver|submitter|admission}")
 	}
 	switch args[0] {
 	case "version":
@@ -69,6 +70,10 @@ func run(ctx context.Context, args []string) error {
 		return reporter(ctx, args[1:])
 	case "analytics-projector":
 		return analyticsProjector(ctx, args[1:])
+	case "intel-projector":
+		return intelProjector(ctx, args[1:])
+	case "intel":
+		return intelCommand(ctx, args[1:])
 	case "analytics":
 		return analyticsCommand(ctx, args[1:])
 	case "results-api":
@@ -91,6 +96,112 @@ func run(ctx context.Context, args []string) error {
 		return admissionCommand(ctx, args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+func intelCommand(ctx context.Context, args []string) error {
+	if len(args) == 0 || (args[0] != "rebuild" && args[0] != "activate") {
+		return errors.New("usage: mailproof intel {rebuild|activate}")
+	}
+	fs := flag.NewFlagSet("intel "+args[0], flag.ContinueOnError)
+	state := fs.String("state", "/state/mailproof.sqlite", "SQLite state database")
+	version := fs.String("policy-version", intel.PolicyVersion, "projection policy version")
+	dryRun := fs.Bool("dry-run", false, "validate without mutation")
+	confirm := fs.Bool("confirm", false, "perform the requested mutation")
+	keyFile := fs.String("indicator-key-file", "/runtime/secrets/indicator-hmac-key", "indicator HMAC key")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if *dryRun == *confirm || *version == "" {
+		return errors.New("intel operation requires exactly one of --dry-run or --confirm and a policy version")
+	}
+	db, err := queue.Open(ctx, *state)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if *dryRun {
+		return emitStatus("intel-"+args[0], "dry-run", 0)
+	}
+	if args[0] == "activate" {
+		_, err = db.ExecContext(ctx, `UPDATE campaign_projections SET active=CASE WHEN projection_version=? THEN 1 ELSE 0 END`, *version)
+		if err != nil {
+			return err
+		}
+		return emitStatus("intel-activate", "completed", 0)
+	}
+	info, err := os.Stat(*keyFile)
+	if err != nil || info.Mode().Perm()&0o077 != 0 {
+		return errors.New("indicator key must be a readable 0600 file")
+	}
+	key, err := os.ReadFile(*keyFile)
+	if err != nil || len(key) < 32 {
+		return errors.New("indicator key must contain at least 32 bytes")
+	}
+	p := intel.Projector{DB: db, CampaignKey: key, PolicyVersion: *version}
+	if err := p.RebuildComponents(ctx); err != nil {
+		return err
+	}
+	return emitStatus("intel-rebuild", "completed", 0)
+}
+
+func intelProjector(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("intel-projector", flag.ContinueOnError)
+	state := fs.String("state", "/state/mailproof.sqlite", "SQLite state database")
+	artifacts := fs.String("artifacts", "/artifacts", "artifact root")
+	keyFile := fs.String("indicator-key-file", "/runtime/secrets/indicator-hmac-key", "indicator HMAC key")
+	verification := fs.String("verification-key-file", "/runtime/secrets/report-verification-key.pem", "report verification public key")
+	once := fs.Bool("once", false, "project one bounded batch and exit")
+	watch := fs.Bool("watch", false, "continue projecting")
+	batch := fs.Int("batch-size", 25, "outbox rows per transaction (1..25)")
+	poll := fs.Duration("poll-interval", time.Second, "idle poll interval")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *once == *watch || *batch < 1 || *batch > 25 || *poll <= 0 {
+		return errors.New("intel-projector requires exactly one of --once or --watch, batch-size 1..25, and positive poll interval")
+	}
+	// The key is intentionally permission-checked even though signed envelopes
+	// already contain fingerprints: a missing/rotated key must not activate a
+	// projection version by accident.
+	if info, err := os.Stat(*keyFile); err != nil || info.Mode().Perm()&0o077 != 0 {
+		return errors.New("indicator key must be a readable 0600 file")
+	}
+	indicatorKey, err := os.ReadFile(*keyFile)
+	if err != nil || len(indicatorKey) < 32 {
+		return errors.New("indicator key must contain at least 32 bytes")
+	}
+	pemBytes, err := os.ReadFile(*verification)
+	if err != nil {
+		return err
+	}
+	public, _, err := report.ParsePublicKey(pemBytes)
+	if err != nil {
+		return err
+	}
+	db, err := queue.Open(ctx, *state)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	owner, err := randomID()
+	if err != nil {
+		return err
+	}
+	p := intel.Projector{DB: db, Artifacts: *artifacts, Trusted: []ed25519.PublicKey{public}, CampaignKey: indicatorKey}
+	for {
+		n, err := p.ProjectOnce(ctx, owner, *batch)
+		if err != nil {
+			return err
+		}
+		if *once {
+			return emitStatus("intel-projector", "completed", n)
+		}
+		select {
+		case <-ctx.Done():
+			return emitStatus("intel-projector", "stopped", n)
+		case <-time.After(*poll):
+		}
 	}
 }
 
@@ -1108,7 +1219,15 @@ func reportRun(ctx context.Context, db *sql.DB, run *queue.Run, root, keyPath, r
 	if raw, err := os.ReadFile(filepath.Join(root, "runs", run.ID, "analysis", "verdict.json")); err != nil || json.Unmarshal(raw, &verdict) != nil {
 		return "", false, errors.New("read analysis verdict")
 	}
-	reportInput := report.Input{RunID: run.ID, DeliveryID: run.DeliveryID, DeliveredOriginalDigest: digest, AuthContextScope: evidence.LocalIngress, Verdict: verdict, PolicyVersion: "v1", ToolVersions: []string{version}, MissingAnalyzers: verdict.Unavailable, Timeline: []report.TimelineEvent{{Kind: "analysis", Claim: "sealed analysis published"}}}
+	evidenceBytes, err := os.ReadFile(filepath.Join(root, "runs", run.ID, "analysis", "evidence.json"))
+	if err != nil {
+		return "", false, errors.New("read analysis evidence")
+	}
+	// Analyzer output is not promoted here: absent a typed safe-evidence adapter,
+	// report publication explicitly records unavailable values rather than parsing
+	// raw evidence, mail, or display strings in the reporter.
+	campaignEvidence := &report.CampaignEvidence{Schema: report.CampaignEvidenceSchema, NormalizationVersion: intel.NormalizationVersion, PolicyVersion: "v1", SourceArtifactDigest: evidence.Digest(evidenceBytes), Availability: []report.CampaignAvailability{{Type: "risky_landing_domain", Reason: "unavailable"}, {Type: "redirect_domain", Reason: "unavailable"}, {Type: "selected_from_domain", Reason: "unavailable"}, {Type: "dkim_domain", Reason: "unavailable"}, {Type: "attachment_sha256", Reason: "unavailable"}, {Type: "subject_fingerprint", Reason: "unavailable"}}}
+	reportInput := report.Input{RunID: run.ID, DeliveryID: run.DeliveryID, DeliveredOriginalDigest: digest, AuthContextScope: evidence.LocalIngress, Verdict: verdict, PolicyVersion: "v1", ToolVersions: []string{version}, MissingAnalyzers: verdict.Unavailable, Timeline: []report.TimelineEvent{{Kind: "analysis", Claim: "sealed analysis published"}}, CampaignEvidence: campaignEvidence}
 	documents, err := report.Publish(root, reportInput)
 	if err != nil {
 		return "", false, err

@@ -23,6 +23,26 @@ func TestStatusRequiresJSON(t *testing.T) {
 	}
 }
 
+func TestIntelRebuildAndActivationRequireExplicitConfirm(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "state.sqlite")
+	if err := run(context.Background(), []string{"intel", "rebuild", "--state", state, "--dry-run"}); err != nil {
+		t.Fatalf("rebuild dry-run: %v", err)
+	}
+	key := filepath.Join(t.TempDir(), "indicator-key")
+	if err := os.WriteFile(key, []byte("01234567890123456789012345678901"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), []string{"intel", "rebuild", "--state", state, "--indicator-key-file", key, "--confirm"}); err != nil {
+		t.Fatalf("rebuild confirm: %v", err)
+	}
+	if err := run(context.Background(), []string{"intel", "activate", "--state", state, "--dry-run"}); err != nil {
+		t.Fatalf("activate dry-run: %v", err)
+	}
+	if err := run(context.Background(), []string{"intel", "activate", "--state", state, "--confirm"}); err != nil {
+		t.Fatalf("activate confirm: %v", err)
+	}
+}
+
 func TestAnalyticsCommandsRequireExplicitModeAndRetentionBackup(t *testing.T) {
 	dir := t.TempDir()
 	state := filepath.Join(dir, "analytics.sqlite")

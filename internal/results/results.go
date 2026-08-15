@@ -41,7 +41,12 @@ func InsertRecord(ctx context.Context, db *sql.DB, r Record) error {
 		return ErrInvalidQuery
 	}
 	q := `INSERT INTO result_records(run_id,delivery_id,submitter_id,occurred_at,verdict,policy_version,schema_version,auth_scope,selected_subject_status,unavailable_analyzers,risk_summary,category_summary,manifest_digest,manifest_path,source_artifact_digests,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO NOTHING`
-	res, err := db.ExecContext(ctx, q, r.RunID, r.DeliveryID, nullable(r.SubmitterID), r.OccurredAt.UTC().Unix(), r.Verdict, r.PolicyVersion, r.SchemaVersion, r.AuthScope, r.SelectedSubjectStatus, r.UnavailableAnalyzers, r.RiskSummary, r.CategorySummary, r.ManifestDigest, r.ManifestPath, r.SourceArtifactDigests, time.Now().UTC().Unix())
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin result projection: %w", err)
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, q, r.RunID, r.DeliveryID, nullable(r.SubmitterID), r.OccurredAt.UTC().Unix(), r.Verdict, r.PolicyVersion, r.SchemaVersion, r.AuthScope, r.SelectedSubjectStatus, r.UnavailableAnalyzers, r.RiskSummary, r.CategorySummary, r.ManifestDigest, r.ManifestPath, r.SourceArtifactDigests, time.Now().UTC().Unix())
 	if err != nil {
 		return fmt.Errorf("insert result record: %w", err)
 	}
@@ -50,17 +55,20 @@ func InsertRecord(ctx context.Context, db *sql.DB, r Record) error {
 		return fmt.Errorf("result rows affected: %w", err)
 	}
 	if n == 1 {
-		return nil
+		if _, err := tx.ExecContext(ctx, `INSERT INTO intel_projection_outbox(run_id,manifest_path,manifest_digest,created_at) VALUES(?,?,?,?)`, r.RunID, r.ManifestPath, r.ManifestDigest, time.Now().UTC().Unix()); err != nil {
+			return fmt.Errorf("enqueue intel projection: %w", err)
+		}
+		return tx.Commit()
 	}
 	var old Record
 	var oldAt int64
-	err = db.QueryRowContext(ctx, `SELECT run_id,delivery_id,COALESCE(submitter_id,''),occurred_at,verdict,policy_version,schema_version,auth_scope,selected_subject_status,unavailable_analyzers,risk_summary,category_summary,manifest_digest,manifest_path,source_artifact_digests FROM result_records WHERE run_id=?`, r.RunID).Scan(&old.RunID, &old.DeliveryID, &old.SubmitterID, &oldAt, &old.Verdict, &old.PolicyVersion, &old.SchemaVersion, &old.AuthScope, &old.SelectedSubjectStatus, &old.UnavailableAnalyzers, &old.RiskSummary, &old.CategorySummary, &old.ManifestDigest, &old.ManifestPath, &old.SourceArtifactDigests)
+	err = tx.QueryRowContext(ctx, `SELECT run_id,delivery_id,COALESCE(submitter_id,''),occurred_at,verdict,policy_version,schema_version,auth_scope,selected_subject_status,unavailable_analyzers,risk_summary,category_summary,manifest_digest,manifest_path,source_artifact_digests FROM result_records WHERE run_id=?`, r.RunID).Scan(&old.RunID, &old.DeliveryID, &old.SubmitterID, &oldAt, &old.Verdict, &old.PolicyVersion, &old.SchemaVersion, &old.AuthScope, &old.SelectedSubjectStatus, &old.UnavailableAnalyzers, &old.RiskSummary, &old.CategorySummary, &old.ManifestDigest, &old.ManifestPath, &old.SourceArtifactDigests)
 	if err != nil {
 		return fmt.Errorf("read existing result record: %w", err)
 	}
 	old.OccurredAt = time.Unix(oldAt, 0).UTC()
 	if old.DeliveryID == r.DeliveryID && old.Verdict == r.Verdict && old.ManifestDigest == r.ManifestDigest && old.ManifestPath == r.ManifestPath {
-		return nil
+		return tx.Commit()
 	}
 	return errors.New("conflicting immutable result record")
 }
@@ -94,6 +102,28 @@ type Filter struct {
 type Page[T any] struct {
 	Items      []T    `json:"items"`
 	NextCursor string `json:"next_cursor,omitempty"`
+}
+
+// Campaign and CampaignMember are privacy-reduced campaign projections. They
+// deliberately contain only opaque run/campaign identifiers and timestamps.
+type Campaign struct {
+	ID, ProjectionVersion, SupersededBy string
+	FirstSeen, LastSeen                 time.Time
+	Hits                                int
+	Active                              bool
+}
+type CampaignMember struct {
+	RunID      string
+	OccurredAt time.Time
+}
+type CampaignDetail struct {
+	Campaign        Campaign `json:"campaign"`
+	GroupingReasons []string `json:"grouping_reasons"`
+	SafeIndicators  []string `json:"safe_indicators"`
+}
+type CampaignFilter struct {
+	Status, ProjectionVersion, Cursor string
+	Limit                             int
 }
 type Repository struct {
 	DB        *sql.DB
@@ -314,6 +344,138 @@ func (r Repository) Decisions(ctx context.Context, f Filter) (Page[Decision], er
 		p.NextCursor = r.cursorFor("decision", last.ID, last.OccurredAt)
 	}
 	return p, nil
+}
+
+func (r Repository) Campaigns(ctx context.Context, f CampaignFilter) (Page[Campaign], error) {
+	n, err := r.validate(Filter{Limit: f.Limit})
+	if err != nil || (f.Status != "" && f.Status != "active" && f.Status != "inactive") {
+		return Page[Campaign]{}, ErrInvalidQuery
+	}
+	where, args := []string{"1=1"}, []any{}
+	if f.Status == "active" {
+		where = append(where, "active=1")
+	}
+	if f.Status == "inactive" {
+		where = append(where, "active=0")
+	}
+	if f.ProjectionVersion != "" {
+		where, args = append(where, "projection_version=?"), append(args, f.ProjectionVersion)
+	}
+	if f.Cursor != "" {
+		c, err := r.parseCursor("campaign", f.Cursor)
+		if err != nil {
+			return Page[Campaign]{}, err
+		}
+		where, args = append(where, "(last_seen < ? OR (last_seen=? AND campaign_id < ?))"), append(args, c.At, c.At, c.ID)
+	}
+	args = append(args, n+1)
+	rows, err := r.DB.QueryContext(ctx, `SELECT campaign_id,projection_version,superseded_by,first_seen,last_seen,hit_count,active FROM campaign_projections WHERE `+strings.Join(where, " AND ")+` ORDER BY last_seen DESC,campaign_id DESC LIMIT ?`, args...)
+	if err != nil {
+		return Page[Campaign]{}, fmt.Errorf("query campaigns: %w", err)
+	}
+	defer rows.Close()
+	p := Page[Campaign]{}
+	for rows.Next() {
+		var x Campaign
+		var first, last int64
+		var active int
+		if err := rows.Scan(&x.ID, &x.ProjectionVersion, &x.SupersededBy, &first, &last, &x.Hits, &active); err != nil {
+			return p, err
+		}
+		x.FirstSeen, x.LastSeen, x.Active = time.Unix(first, 0).UTC(), time.Unix(last, 0).UTC(), active == 1
+		p.Items = append(p.Items, x)
+	}
+	if err := rows.Err(); err != nil {
+		return p, err
+	}
+	if len(p.Items) > n {
+		last := p.Items[n-1]
+		p.Items = p.Items[:n]
+		p.NextCursor = r.cursorFor("campaign", last.ID, last.LastSeen)
+	}
+	return p, nil
+}
+
+func (r Repository) CampaignMembers(ctx context.Context, campaignID, version, rawCursor string, limit int) (Page[CampaignMember], error) {
+	n, err := r.validate(Filter{Limit: limit})
+	if err != nil || campaignID == "" || version == "" {
+		return Page[CampaignMember]{}, ErrInvalidQuery
+	}
+	where, args := []string{"projection_version=?", "campaign_id=?"}, []any{version, campaignID}
+	if rawCursor != "" {
+		c, err := r.parseCursor("campaign-member:"+campaignID+":"+version, rawCursor)
+		if err != nil {
+			return Page[CampaignMember]{}, err
+		}
+		where, args = append(where, "(occurred_at < ? OR (occurred_at=? AND run_id < ?))"), append(args, c.At, c.At, c.ID)
+	}
+	args = append(args, n+1)
+	rows, err := r.DB.QueryContext(ctx, `SELECT run_id,occurred_at FROM campaign_members WHERE `+strings.Join(where, " AND ")+` ORDER BY occurred_at DESC,run_id DESC LIMIT ?`, args...)
+	if err != nil {
+		return Page[CampaignMember]{}, fmt.Errorf("query campaign members: %w", err)
+	}
+	defer rows.Close()
+	p := Page[CampaignMember]{}
+	for rows.Next() {
+		var x CampaignMember
+		var at int64
+		if err := rows.Scan(&x.RunID, &at); err != nil {
+			return p, err
+		}
+		x.OccurredAt = time.Unix(at, 0).UTC()
+		p.Items = append(p.Items, x)
+	}
+	if err := rows.Err(); err != nil {
+		return p, err
+	}
+	if len(p.Items) > n {
+		last := p.Items[n-1]
+		p.Items = p.Items[:n]
+		p.NextCursor = r.cursorFor("campaign-member:"+campaignID+":"+version, last.RunID, last.OccurredAt)
+	}
+	return p, nil
+}
+
+func (r Repository) CampaignDetail(ctx context.Context, campaignID, version string) (CampaignDetail, error) {
+	if r.DB == nil || campaignID == "" || version == "" {
+		return CampaignDetail{}, ErrInvalidQuery
+	}
+	var out CampaignDetail
+	var first, last int64
+	var active int
+	err := r.DB.QueryRowContext(ctx, `SELECT campaign_id,projection_version,superseded_by,first_seen,last_seen,hit_count,active FROM campaign_projections WHERE projection_version=? AND campaign_id=?`, version, campaignID).Scan(&out.Campaign.ID, &out.Campaign.ProjectionVersion, &out.Campaign.SupersededBy, &first, &last, &out.Campaign.Hits, &active)
+	if err != nil {
+		return CampaignDetail{}, err
+	}
+	out.Campaign.FirstSeen, out.Campaign.LastSeen, out.Campaign.Active = time.Unix(first, 0).UTC(), time.Unix(last, 0).UTC(), active == 1
+	rows, err := r.DB.QueryContext(ctx, `SELECT DISTINCT rule_id||':'||strong_grouping_key FROM run_grouping_edges WHERE projection_version=? AND run_id IN (SELECT run_id FROM campaign_members WHERE projection_version=? AND campaign_id=?) ORDER BY 1 LIMIT 32`, version, version, campaignID)
+	if err != nil {
+		return CampaignDetail{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			return CampaignDetail{}, err
+		}
+		out.GroupingReasons = append(out.GroupingReasons, value)
+	}
+	if err := rows.Err(); err != nil {
+		return CampaignDetail{}, err
+	}
+	rows, err = r.DB.QueryContext(ctx, `SELECT DISTINCT indicator_type||':'||indicator_value FROM run_indicators WHERE projection_version=? AND run_id IN (SELECT run_id FROM campaign_members WHERE projection_version=? AND campaign_id=?) ORDER BY 1 LIMIT 32`, version, version, campaignID)
+	if err != nil {
+		return CampaignDetail{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			return CampaignDetail{}, err
+		}
+		out.SafeIndicators = append(out.SafeIndicators, value)
+	}
+	return out, rows.Err()
 }
 
 func nullable(s string) any {

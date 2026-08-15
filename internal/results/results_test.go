@@ -75,6 +75,21 @@ func TestAPIAuthenticationAndPrivacy(t *testing.T) {
 	}
 }
 
+func TestCampaignAPIRejectsUnknownQueryAndTamperedCursor(t *testing.T) {
+	r := testRepository(t)
+	token := []byte("abcdefghijklmnopqrstuvwxyz0123456789")
+	h := API{Repository: r, Token: token}.Handler()
+	for _, path := range []string{"/v1/campaigns?unknown=x", "/v1/campaigns?cursor=not-a-cursor"} {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request.Header.Set("Authorization", "Bearer "+string(token))
+		response := httptest.NewRecorder()
+		h.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest || response.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("%s: status=%d headers=%v", path, response.Code, response.Header())
+		}
+	}
+}
+
 func TestSummaryRequiresBoundedUTCWindow(t *testing.T) {
 	r := testRepository(t)
 	if _, err := r.Summary(context.Background(), time.Time{}, time.Now(), "hour"); err != ErrInvalidQuery {

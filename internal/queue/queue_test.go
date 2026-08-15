@@ -174,7 +174,7 @@ func TestMigrationRecordsVersion(t *testing.T) {
 	if err := db.QueryRow(`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 9 {
+	if version != 11 {
 		t.Fatalf("version=%d", version)
 	}
 }

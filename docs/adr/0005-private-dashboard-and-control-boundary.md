@@ -93,3 +93,16 @@ v1 session correlation into a human identity.
 Dashboard access is intentionally private but unauthenticated in v1; it is not
 safe to publish. Signing keys remain confined to their runtime/report boundary,
 and the dashboard only consumes reduced internal API projections.
+
+## Campaign evidence publication
+
+Campaign projection consumes only the versioned `mailproof.campaign-evidence/v1`
+section of a signature-verified `report.json`; its digest is bound by the
+signed manifest. The section is fail-closed when absent, malformed, unknown, or
+unverified. It may contain only canonical registrable domains, attachment
+SHA-256/coarse MIME/extension classes, keyed subject fingerprints and key ID,
+allow-listed organization/mismatch/network-ASN classifications, provenance
+digest, policy/normalization versions, and reason-coded availability/truncation
+facts. It must never contain message/header/body bytes, URLs, paths, queries,
+addresses/local parts, filenames, subject text, peer IPs, credentials, tokens,
+or key material.
