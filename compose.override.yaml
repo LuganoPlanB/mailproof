@@ -53,6 +53,9 @@ services:
   reporter:
     build: *mailproof-build
 
+  results-api:
+    build: *mailproof-build
+
   smoke:
     build:
       context: .

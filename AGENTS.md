@@ -34,6 +34,13 @@ before changing this path or the meaning of evidence.
 - Reporter signing material is confined to the read-only runtime volume and the
   report network. Keep analyzer, scanner, mail, report, and public network
   boundaries intact.
+- Admission accepts only an active submitter capability bound to the observed
+  envelope sender and SPF pass. Selected-subject sender allowlisting is a
+  separate post-DATA eligibility check and must never authenticate a detached
+  child or route replies from message headers.
+- Result and rejection rows are rebuildable projections; signed immutable
+  artifacts remain authoritative. Keep the results API internal, token-gated,
+  bounded, and free of raw mail, addresses, peer IPs, capabilities, and keys.
 - Missing or invalid scanner data is unavailable/indeterminate, never a clean
   result. Security exceptions must be declared in
   `config/security-exceptions.yml` with owner, expiry, rationale, and a
@@ -49,6 +56,9 @@ before changing this path or the meaning of evidence.
 - `internal/ingress/`: transaction-to-delivery correlation.
 - `internal/queue/`: SQLite schema, leases, retries, replay, and quarantine.
 - `internal/report/`: rendering, replies, signing, and verification.
+- `internal/admission/`, `internal/submitter/`, `internal/results/`: trusted
+  sender admission, enrolled identity, rejection/result projections, and the
+  authenticated internal read API.
 - `compose.yaml`, `containers/`, `config/`: production topology, images, pinned
   versions, and service configuration.
 - `compose.override.yaml`: automatically loaded source-build definitions. The
