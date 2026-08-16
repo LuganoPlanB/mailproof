@@ -113,7 +113,7 @@
 }
 
 @test "remote quality smoke includes the dashboard profile and isolated browser checks" {
-  run python3 -c 'from pathlib import Path; workflow=Path(".github/workflows/quality.yml").read_text(); assert "--profile smoke --profile dashboard build --pull" in workflow; assert "--profile dashboard up -d --wait" in workflow; assert "npm --prefix tests/browser ci" in workflow; assert "DASHBOARD_URL=http://localhost:3000 npm --prefix tests/browser test -- compose.spec.js" in workflow; assert "npm --prefix tests/browser test -- dashboard.spec.js" in workflow; spec=Path("tests/browser/dashboard.spec.js").read_text(); assert "BROWSER_EVIDENCE_DIR" in spec and "test-results/evidence" in spec; compose=Path("tests/browser/compose.spec.js").read_text(); assert "unexpected" in compose and "dashboardURL" in compose'
+  run python3 -c 'from pathlib import Path; workflow=Path(".github/workflows/quality.yml").read_text(); assert "--profile smoke --profile dashboard build --pull" in workflow; assert "--profile dashboard up -d --wait" in workflow; assert "npm --prefix tests/browser ci" in workflow; assert "DASHBOARD_URL=http://127.0.0.1:3000 npm --prefix tests/browser test -- compose.spec.js" in workflow; assert "npm --prefix tests/browser test -- dashboard.spec.js" in workflow; spec=Path("tests/browser/dashboard.spec.js").read_text(); assert "BROWSER_EVIDENCE_DIR" in spec and "test-results/evidence" in spec; compose=Path("tests/browser/compose.spec.js").read_text(); assert "unexpected" in compose and "dashboardURL" in compose'
   [ "$status" -eq 0 ]
 }
 
