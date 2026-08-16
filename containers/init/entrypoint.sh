@@ -4,7 +4,11 @@ umask 077
 
 runtime=/runtime
 mkdir -p -- "${runtime}/secrets" "${runtime}/config" "${runtime}/artifacts" /clamav-db /artifacts /state /reports /var/mail/verification /var/log/mailproof
-chmod 0700 -- "${runtime}" "${runtime}/secrets" "${runtime}/config"
+# App containers run as the fixed mailproof UID. Let that UID traverse the
+# runtime mount, but keep its secret/config directories private to it.
+chmod 0711 -- "${runtime}"
+chown 1000:1000 -- "${runtime}/secrets" "${runtime}/config"
+chmod 0700 -- "${runtime}/secrets" "${runtime}/config"
 if [[ ! -e ${runtime}/secrets/submitters.json ]]; then
 	printf '%s\n' '[]' >"${runtime}/secrets/submitters.json"
 fi
@@ -47,4 +51,5 @@ if [[ ! -e ${runtime}/config/subject-sender-domain-allowlist ]]; then
 	printf '%s\n' "${MAILPROOF_SUBJECT_SENDER_DOMAIN_ALLOWLIST:-}" >"${runtime}/config/subject-sender-domain-allowlist"
 fi
 chmod 0600 -- "${runtime}/config/subject-sender-domain-allowlist"
+chown -R 1000:1000 -- "${runtime}/secrets" "${runtime}/config"
 chown 1000:1000 /artifacts /state /reports /var/mail/verification /var/log/mailproof
