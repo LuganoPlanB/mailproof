@@ -47,6 +47,29 @@ func TestDashboardLoopbackHost(t *testing.T) {
 	}
 }
 
+func TestDashboardPublicOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		origin string
+		wantOK bool
+	}{
+		{"https remote", "https://dashboard.example.test", true},
+		{"http localhost", "http://localhost:3000", true},
+		{"http ipv4 loopback", "http://127.0.0.1:3000", true},
+		{"http ipv6 loopback", "http://[::1]:3000", true},
+		{"http remote", "http://dashboard.example.test", false},
+		{"http unspecified", "http://0.0.0.0:3000", false},
+		{"path", "https://dashboard.example.test/path", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := dashboardPublicOrigin(tc.origin)
+			if (err == nil) != tc.wantOK {
+				t.Fatalf("dashboardPublicOrigin(%q) = %v", tc.origin, err)
+			}
+		})
+	}
+}
+
 func TestControlAPIRequiresPrivateBinding(t *testing.T) {
 	for _, tc := range []struct {
 		address string
