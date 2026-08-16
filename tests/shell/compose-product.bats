@@ -45,7 +45,7 @@
 }
 
 @test "init provisions separated dashboard and control keys with owner-only modes" {
-  run python3 -c 'from pathlib import Path; text=Path("containers/init/entrypoint.sh").read_text(); names=("control-api-token", "control-confirmation-hmac-key", "dashboard-session-hmac-key", "indicator-hmac-key", "report-verification-key.pem"); assert all(name in text for name in names); assert "openssl pkey" in text; assert "chmod 0600" in text'
+  run python3 -c 'from pathlib import Path; text=Path("containers/init/entrypoint.sh").read_text(); names=("control-api-token", "control-confirmation-hmac-key", "dashboard-session-hmac-key", "indicator-hmac-key", "report-verification-key.pem"); assert all(name in text for name in names); assert "openssl pkey" in text; assert "chmod 0711" in text; assert "chmod 0700" in text; assert "chmod 0600" in text; assert "chown -R 1000:1000 -- \"${runtime}/secrets\" \"${runtime}/config\"" in text'
   [ "$status" -eq 0 ]
 }
 
