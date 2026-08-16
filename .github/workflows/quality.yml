@@ -85,7 +85,7 @@ jobs:
         run: |
           npm --prefix tests/browser ci
           npx --prefix tests/browser playwright install --with-deps chromium
-          DASHBOARD_URL=http://localhost:3000 npm --prefix tests/browser test -- compose.spec.js
+          DASHBOARD_URL=http://127.0.0.1:3000 npm --prefix tests/browser test -- compose.spec.js
           npm --prefix tests/browser test -- dashboard.spec.js
       - name: Upload redacted browser diagnostics
         if: failure()
