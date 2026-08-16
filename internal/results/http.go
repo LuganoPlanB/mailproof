@@ -31,6 +31,55 @@ type Dashboard interface {
 	Operations(context.Context, analytics.Query) (analytics.Snapshot, error)
 }
 
+type resultArtifact struct {
+	Status string `json:"status"`
+	ID     string `json:"id"`
+}
+
+type resultResource struct {
+	SchemaVersion string         `json:"schema_version"`
+	RunID         string         `json:"run_id"`
+	DeliveryID    string         `json:"delivery_id"`
+	SubmitterID   string         `json:"submitter_id,omitempty"`
+	OccurredAt    time.Time      `json:"occurred_at"`
+	Outcome       string         `json:"outcome"`
+	Verdict       string         `json:"verdict"`
+	PolicyVersion string         `json:"policy_version"`
+	Artifact      resultArtifact `json:"artifact"`
+}
+
+type resultPage struct {
+	SchemaVersion string           `json:"schema_version"`
+	Items         []resultResource `json:"items"`
+	NextCursor    string           `json:"next_cursor,omitempty"`
+}
+
+func resultView(record Record) resultResource {
+	id := record.ManifestDigest
+	if !strings.HasPrefix(id, "sha256:") {
+		id = "sha256:" + id
+	}
+	return resultResource{
+		SchemaVersion: "mailproof.result/v1",
+		RunID:         record.RunID,
+		DeliveryID:    record.DeliveryID,
+		SubmitterID:   record.SubmitterID,
+		OccurredAt:    record.OccurredAt,
+		Outcome:       "COMPLETE",
+		Verdict:       record.Verdict,
+		PolicyVersion: record.PolicyVersion,
+		Artifact:      resultArtifact{Status: "signed", ID: id},
+	}
+}
+
+func resultViews(page Page[Record]) resultPage {
+	items := make([]resultResource, 0, len(page.Items))
+	for _, record := range page.Items {
+		items = append(items, resultView(record))
+	}
+	return resultPage{SchemaVersion: "mailproof.page/v1", Items: items, NextCursor: page.NextCursor}
+}
+
 func (a API) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.health)
@@ -140,7 +189,7 @@ func (a API) results(w http.ResponseWriter, r *http.Request) {
 		var p Page[Record]
 		p, err = a.Repository.Results(r.Context(), f)
 		if err == nil {
-			writeJSON(w, http.StatusOK, p)
+			writeJSON(w, http.StatusOK, resultViews(p))
 			return
 		}
 	}
@@ -167,7 +216,20 @@ func (a API) result(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	q.Set("id", id)
 	r.URL.RawQuery = q.Encode()
-	a.results(w, r)
+	f, err := filter(r)
+	if err == nil {
+		var page Page[Record]
+		page, err = a.Repository.Results(r.Context(), f)
+		if err == nil && len(page.Items) == 1 {
+			writeJSON(w, http.StatusOK, resultView(page.Items[0]))
+			return
+		}
+	}
+	if err == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	writeQueryError(w, err)
 }
 func (a API) decision(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/v1/decisions/")

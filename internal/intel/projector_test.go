@@ -2,7 +2,9 @@ package intel
 
 import (
 	"context"
+	"crypto/ed25519"
 	"database/sql"
+	"sort"
 	"testing"
 	"time"
 
@@ -11,20 +13,20 @@ import (
 
 func TestStrongKeysOnlyUseReviewedRules(t *testing.T) {
 	values := []Indicator{
-		{Type: "attachment_sha256", Digest: "attachment"},
-		{Type: "risky_landing_domain", Digest: "landing"},
-		{Type: "redirect_domain", Digest: "redirect"},
-		{Type: "selected_from_domain", Digest: "sender"},
-		{Type: "subject_fingerprint", Digest: "subject"},
-		{Type: "attachment_mime", Digest: "weak-mime"},
-		{Type: "impersonated_organization", Digest: "weak-org"},
+		{Type: "attachment_sha256", Value: "attachment"},
+		{Type: "risky_landing_domain", Value: "landing.example"},
+		{Type: "redirect_domain", Value: "redirect.example"},
+		{Type: "selected_from_domain", Value: "sender.example"},
+		{Type: "subject_fingerprint", Value: "subject"},
+		{Type: "attachment_mime", Value: "weak-mime"},
+		{Type: "impersonated_organization", Value: "weak-org"},
 	}
 	got := strongKeys(values)
 	if len(got) != 4 {
 		t.Fatalf("strong keys = %#v", got)
 	}
 	for _, key := range got {
-		if key.value == "weak-mime" || key.value == "weak-org" {
+		if key.value == groupingDigest("attachment_mime", "weak-mime") || key.value == groupingDigest("impersonated_organization", "weak-org") {
 			t.Fatalf("weak indicator created edge: %#v", key)
 		}
 	}
@@ -36,14 +38,15 @@ func TestStrongKeysAcceptSelectedOrSignerOnlyWithSubject(t *testing.T) {
 		values []Indicator
 		want   []string
 	}{
-		{"selected", []Indicator{{Type: "selected_from_domain", Digest: "from"}, {Type: "subject_fingerprint", Digest: "subject"}}, []string{"from:subject"}},
-		{"signer", []Indicator{{Type: "dkim_domain", Digest: "signer"}, {Type: "subject_fingerprint", Digest: "subject"}}, []string{"signer:subject"}},
-		{"both", []Indicator{{Type: "selected_from_domain", Digest: "from"}, {Type: "dkim_domain", Digest: "signer"}, {Type: "subject_fingerprint", Digest: "subject"}}, []string{"from:subject", "signer:subject"}},
-		{"neither", []Indicator{{Type: "selected_from_domain", Digest: "from"}, {Type: "dkim_domain", Digest: "signer"}}, nil},
+		{"selected", []Indicator{{Type: "selected_from_domain", Value: "from.example"}, {Type: "subject_fingerprint", Value: "subject"}}, []string{groupingDigest("sender-domain", "from.example") + ":" + groupingDigest("subject-fingerprint", "subject")}},
+		{"signer", []Indicator{{Type: "dkim_domain", Value: "signer.example"}, {Type: "subject_fingerprint", Value: "subject"}}, []string{groupingDigest("sender-domain", "signer.example") + ":" + groupingDigest("subject-fingerprint", "subject")}},
+		{"both", []Indicator{{Type: "selected_from_domain", Value: "from.example"}, {Type: "dkim_domain", Value: "signer.example"}, {Type: "subject_fingerprint", Value: "subject"}}, []string{groupingDigest("sender-domain", "from.example") + ":" + groupingDigest("subject-fingerprint", "subject"), groupingDigest("sender-domain", "signer.example") + ":" + groupingDigest("subject-fingerprint", "subject")}},
+		{"neither", []Indicator{{Type: "selected_from_domain", Value: "from.example"}, {Type: "dkim_domain", Value: "signer.example"}}, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := strongKeys(tt.values)
+			sort.Strings(tt.want)
 			if len(got) != len(tt.want) {
 				t.Fatalf("keys=%#v", got)
 			}
@@ -53,6 +56,47 @@ func TestStrongKeysAcceptSelectedOrSignerOnlyWithSubject(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestStrongKeysGroupLandingAndRedirectByCanonicalDomain(t *testing.T) {
+	keys := strongKeys([]Indicator{
+		{Type: "risky_landing_domain", Value: "shared.example", Digest: "type-specific-landing"},
+		{Type: "redirect_domain", Value: "shared.example", Digest: "type-specific-redirect"},
+	})
+	if len(keys) != 1 || keys[0].rule != "risky-domain" || keys[0].value != groupingDigest("risky-domain", "shared.example") {
+		t.Fatalf("strong keys = %#v", keys)
+	}
+}
+
+func TestProjectOnceClosesClaimRowsBeforeStateWrites(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	db, err := queue.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	seedCampaignRun(t, ctx, db, "run-invalid-path", 100)
+	if _, err := db.ExecContext(ctx, `INSERT INTO intel_projection_outbox(run_id,manifest_path,manifest_digest,created_at) VALUES(?,?,?,?)`, "run-invalid-path", "not/a/bundle", "digest", 100); err != nil {
+		t.Fatal(err)
+	}
+	projector := Projector{
+		DB:          db,
+		Artifacts:   t.TempDir(),
+		Trusted:     []ed25519.PublicKey{make(ed25519.PublicKey, ed25519.PublicKeySize)},
+		CampaignKey: []byte("01234567890123456789012345678901"),
+	}
+	n, err := projector.ProjectOnce(ctx, "worker", 1)
+	if err != nil || n != 1 {
+		t.Fatalf("ProjectOnce() = %d, %v", n, err)
+	}
+	var state, reason string
+	if err := db.QueryRowContext(ctx, `SELECT state,reason_code FROM intel_projection_outbox WHERE run_id=?`, "run-invalid-path").Scan(&state, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if state != "terminal" || reason != "invalid_manifest_path" {
+		t.Fatalf("outbox state = %q, reason = %q", state, reason)
 	}
 }
 

@@ -47,40 +47,57 @@ func (p Projector) ProjectOnce(ctx context.Context, owner string, batch int) (in
 	if err != nil {
 		return 0, err
 	}
-	defer rows.Close()
-	n := 0
+	type workItem struct {
+		run, path, manifestDigest string
+	}
+	items := make([]workItem, 0, batch)
 	for rows.Next() {
-		var run, path, manifestDigest string
-		if err := rows.Scan(&run, &path, &manifestDigest); err != nil {
-			return n, err
+		var item workItem
+		if err := rows.Scan(&item.run, &item.path, &item.manifestDigest); err != nil {
+			_ = rows.Close()
+			return len(items), err
 		}
-		n++
-		// Database paths are trusted only after they meet the immutable bundle layout.
-		bundle, ok := safeBundlePath(p.Artifacts, path, run)
-		if !ok {
-			_ = p.finish(ctx, run, "terminal", "invalid_manifest_path", now)
-			continue
-		}
-		evidence, err := ReadVerifiedCampaignEvidence(bundle, manifestDigest, p.Trusted)
-		if err != nil {
-			_ = p.finish(ctx, run, "terminal", "unverified_evidence", now)
-			continue
-		}
-		if err := p.persist(ctx, run, evidence, now); err != nil {
-			_ = p.finish(ctx, run, "retryable", "projection_failed", now)
-			continue
-		}
-		_ = p.finish(ctx, run, "complete", "", now)
+		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
-		return n, err
+		_ = rows.Close()
+		return len(items), err
 	}
-	if n > 0 {
-		if err := p.RebuildComponents(ctx); err != nil {
-			return n, err
+	if err := rows.Close(); err != nil {
+		return len(items), err
+	}
+	for _, item := range items {
+		// Database paths are trusted only after they meet the immutable bundle layout.
+		bundle, ok := safeBundlePath(p.Artifacts, item.path, item.run)
+		if !ok {
+			if err := p.finish(ctx, item.run, "terminal", "invalid_manifest_path", now); err != nil {
+				return len(items), err
+			}
+			continue
+		}
+		evidence, err := ReadVerifiedCampaignEvidence(bundle, item.manifestDigest, p.Trusted)
+		if err != nil {
+			if err := p.finish(ctx, item.run, "terminal", "unverified_evidence", now); err != nil {
+				return len(items), err
+			}
+			continue
+		}
+		if err := p.persist(ctx, item.run, evidence, now); err != nil {
+			if finishErr := p.finish(ctx, item.run, "retryable", "projection_failed", now); finishErr != nil {
+				return len(items), errors.Join(err, finishErr)
+			}
+			continue
+		}
+		if err := p.finish(ctx, item.run, "complete", "", now); err != nil {
+			return len(items), err
 		}
 	}
-	return n, nil
+	if len(items) > 0 {
+		if err := p.RebuildComponents(ctx); err != nil {
+			return len(items), err
+		}
+	}
+	return len(items), nil
 }
 
 func safeBundlePath(root, manifestPath, run string) (string, bool) {
@@ -137,15 +154,15 @@ func strongKeys(values []Indicator) []groupingKey {
 	for _, v := range values {
 		switch v.Type {
 		case "attachment_sha256":
-			out = append(out, groupingKey{"attachment-sha256", v.Digest})
+			out = append(out, groupingKey{"attachment-sha256", groupingDigest("attachment-sha256", v.Value)})
 		case "risky_landing_domain", "redirect_domain":
-			out = append(out, groupingKey{"risky-domain", v.Digest})
+			out = append(out, groupingKey{"risky-domain", groupingDigest("risky-domain", v.Value)})
 		case "selected_from_domain":
-			domains[v.Digest] = true
+			domains[groupingDigest("sender-domain", v.Value)] = true
 		case "dkim_domain":
-			domains[v.Digest] = true
+			domains[groupingDigest("sender-domain", v.Value)] = true
 		case "subject_fingerprint":
-			subjects[v.Digest] = true
+			subjects[groupingDigest("subject-fingerprint", v.Value)] = true
 		}
 	}
 	// Each selected From or DKIM signer domain independently forms a strong key
@@ -159,6 +176,25 @@ func strongKeys(values []Indicator) []groupingKey {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].rule+"\x00"+out[i].value < out[j].rule+"\x00"+out[j].value })
+	return compactGroupingKeys(out)
+}
+
+func groupingDigest(rule, value string) string {
+	digest := sha256.Sum256([]byte(rule + "\x00" + value))
+	return hex.EncodeToString(digest[:])
+}
+
+func compactGroupingKeys(keys []groupingKey) []groupingKey {
+	if len(keys) < 2 {
+		return keys
+	}
+	out := keys[:1]
+	for _, key := range keys[1:] {
+		last := out[len(out)-1]
+		if key.rule != last.rule || key.value != last.value {
+			out = append(out, key)
+		}
+	}
 	return out
 }
 
