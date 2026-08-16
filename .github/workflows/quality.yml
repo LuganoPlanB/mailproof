@@ -85,6 +85,14 @@ jobs:
         run: |
           npm --prefix tests/browser ci
           npx --prefix tests/browser playwright install --with-deps chromium
+          dashboard_id=$(MAILPROOF_DASHBOARD_HOST=127.0.0.1 MAILPROOF_DASHBOARD_PORT=3000 MAILPROOF_DASHBOARD_PUBLIC_ORIGIN=http://127.0.0.1:3000 docker compose --env-file config/versions.env --profile dashboard run -d --no-deps --service-ports dashboard)
+          for _ in $(seq 1 12); do
+            if [[ $(docker inspect --format '{{.State.Health.Status}}' "${dashboard_id}") == healthy ]]; then
+              break
+            fi
+            sleep 1
+          done
+          test "$(docker inspect --format '{{.State.Health.Status}}' "${dashboard_id}")" = healthy
           DASHBOARD_URL=http://127.0.0.1:3000 npm --prefix tests/browser test -- compose.spec.js
           npm --prefix tests/browser test -- dashboard.spec.js
       - name: Upload redacted browser diagnostics
