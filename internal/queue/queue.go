@@ -177,19 +177,29 @@ func FinishReportAttempt(ctx context.Context, db *sql.DB, attemptID int64, outco
 // RecordRejectedCollection preserves the sealed delivery and its auditable
 // post-DATA rejection without creating an analyzer run.
 func RecordRejectedCollection(ctx context.Context, db *sql.DB, deliveryID, digest, sourceKey, decisionID, reason string, now time.Time) error {
-	return recordRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, reason, nil, now)
+	return recordRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, reason, nil, 0, "", now)
 }
 
 // RecordAdmittedRejectedCollection retains the verified destination snapshot
 // for a post-DATA rejection without consulting untrusted message fields.
 func RecordAdmittedRejectedCollection(ctx context.Context, db *sql.DB, deliveryID, digest, sourceKey, decisionID, reason string, destination ReportDestination, now time.Time) error {
+	return RecordAdmittedRejectedCollectionWithPolicy(ctx, db, deliveryID, digest, sourceKey, decisionID, reason, destination, 0, now)
+}
+
+// RecordAdmittedRejectedCollectionWithPolicy persists the snapshot version
+// used by the post-DATA preflight, so the projection identifies its policy
+// provenance without retaining message-derived values.
+func RecordAdmittedRejectedCollectionWithPolicy(ctx context.Context, db *sql.DB, deliveryID, digest, sourceKey, decisionID, reason string, destination ReportDestination, policyVersion int64, now time.Time) error {
+	return RecordAdmittedRejectedCollectionWithPolicyRule(ctx, db, deliveryID, digest, sourceKey, decisionID, reason, destination, policyVersion, "", now)
+}
+func RecordAdmittedRejectedCollectionWithPolicyRule(ctx context.Context, db *sql.DB, deliveryID, digest, sourceKey, decisionID, reason string, destination ReportDestination, policyVersion int64, ruleID string, now time.Time) error {
 	if destination.SubmitterID == "" || destination.ReplyAddress == "" {
 		return errors.New("admitted rejection requires report destination")
 	}
-	return recordRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, reason, &destination, now)
+	return recordRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, reason, &destination, policyVersion, ruleID, now)
 }
 
-func recordRejectedCollection(ctx context.Context, db *sql.DB, deliveryID, digest, sourceKey, decisionID, reason string, destination *ReportDestination, now time.Time) error {
+func recordRejectedCollection(ctx context.Context, db *sql.DB, deliveryID, digest, sourceKey, decisionID, reason string, destination *ReportDestination, policyVersion int64, ruleID string, now time.Time) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin rejected collection: %w", err)
@@ -202,7 +212,11 @@ func recordRejectedCollection(ctx context.Context, db *sql.DB, deliveryID, diges
 	if _, err := tx.ExecContext(ctx, `INSERT INTO deliveries(delivery_id,message_digest,source_key,collected_at,submitter_id,reply_address) VALUES(?,?,?,?,?,?) ON CONFLICT(source_key) DO NOTHING`, deliveryID, digest, sourceKey, now.Unix(), submitterID, replyAddress); err != nil {
 		return fmt.Errorf("insert rejected delivery: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO submission_decisions(decision_id,envelope_sender,recipient,peer_ip,helo,spf_outcome,stage,reason_code,policy_version,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, decisionID, "", "", "", "", "", "post_data", reason, "v1", now.Unix()); err != nil {
+	version := "v1"
+	if policyVersion > 0 {
+		version = fmt.Sprintf("v%d", policyVersion)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO submission_decisions(decision_id,envelope_sender,recipient,peer_ip,helo,spf_outcome,stage,reason_code,policy_version,applied_rule_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, decisionID, "", "", "", "", "", "post_data", reason, version, ruleID, now.Unix()); err != nil {
 		return fmt.Errorf("insert post-data rejection: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO rejection_work_items(work_id,decision_id,delivery_id,kind,created_at) VALUES(?,?,?,'notarize',?)`, decisionID+"-notarize", decisionID, deliveryID, now.Unix()); err != nil {
@@ -219,7 +233,7 @@ func recordRejectedCollection(ctx context.Context, db *sql.DB, deliveryID, diges
 		return fmt.Errorf("canonical rejection decision: %w", err)
 	}
 	sum := sha256.Sum256(canonical)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO decision_records(decision_id,delivery_id,occurred_at,outcome,stage,reason_code,policy_version,smtp_class,canonical_json,canonical_digest,notarization_status) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(decision_id) DO NOTHING`, decisionID, deliveryID, now.Unix(), "rejected", "post_data", reason, "v1", 550, canonical, hex.EncodeToString(sum[:]), "queued"); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO decision_records(decision_id,delivery_id,occurred_at,outcome,stage,reason_code,policy_version,applied_rule_id,smtp_class,canonical_json,canonical_digest,notarization_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(decision_id) DO NOTHING`, decisionID, deliveryID, now.Unix(), "rejected", "post_data", reason, version, ruleID, 550, canonical, hex.EncodeToString(sum[:]), "queued"); err != nil {
 		return fmt.Errorf("insert rejection projection: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO decision_signing_outbox(decision_id,state,created_at) VALUES(?,'pending',?) ON CONFLICT(decision_id) DO NOTHING`, decisionID, now.Unix()); err != nil {
@@ -415,7 +429,22 @@ CREATE INDEX campaign_members_page ON campaign_members(projection_version,campai
  projection_version TEXT NOT NULL, run_id TEXT NOT NULL REFERENCES runs(run_id), projected_at INTEGER NOT NULL,
  PRIMARY KEY(projection_version,run_id)
 );
-CREATE INDEX intel_projected_runs_version ON intel_projected_runs(projection_version,run_id);`}}
+CREATE INDEX intel_projected_runs_version ON intel_projected_runs(projection_version,run_id);`}, {12, `CREATE TABLE policy_versions (version INTEGER PRIMARY KEY, created_at INTEGER NOT NULL, command_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL);
+INSERT OR IGNORE INTO policy_versions(version,created_at,command_id,digest) VALUES(0,unixepoch(),'bootstrap','');
+CREATE TABLE policy_rules (rule_id TEXT PRIMARY KEY, version INTEGER NOT NULL REFERENCES policy_versions(version), rule_type TEXT NOT NULL, subject TEXT NOT NULL, value TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, expires_at INTEGER, created_at INTEGER NOT NULL);
+CREATE INDEX policy_rules_active ON policy_rules(rule_type,enabled,expires_at,version);
+CREATE TABLE control_commands (command_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, command_type TEXT NOT NULL, command_digest TEXT NOT NULL, expected_version INTEGER NOT NULL, result_version INTEGER, result_code TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE TABLE audit_events (audit_id INTEGER PRIMARY KEY, command_id TEXT NOT NULL REFERENCES control_commands(command_id), actor TEXT NOT NULL, session_id TEXT NOT NULL, command_type TEXT NOT NULL, result_code TEXT NOT NULL, before_digest TEXT NOT NULL, after_digest TEXT NOT NULL, reason TEXT NOT NULL, expires_at INTEGER, created_at INTEGER NOT NULL);
+CREATE INDEX audit_events_page ON audit_events(created_at DESC,audit_id DESC);
+CREATE TABLE confirmation_tokens (token_digest BLOB PRIMARY KEY, command_digest TEXT NOT NULL, session_id TEXT NOT NULL, expected_version INTEGER NOT NULL, expires_at INTEGER NOT NULL, consumed_at INTEGER);
+CREATE INDEX confirmation_tokens_expiry ON confirmation_tokens(expires_at,consumed_at);`}, {13, `ALTER TABLE confirmation_tokens ADD COLUMN command_json BLOB NOT NULL DEFAULT '{}';
+ALTER TABLE confirmation_tokens ADD COLUMN command_type TEXT NOT NULL DEFAULT '';`}, {14, `CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT,'audit append-only'); END;
+CREATE TRIGGER audit_events_no_delete BEFORE DELETE ON audit_events BEGIN SELECT RAISE(ABORT,'audit append-only'); END;`}, {15, `CREATE TABLE policy_bootstrap (singleton INTEGER PRIMARY KEY CHECK(singleton=1), imported_at INTEGER NOT NULL, source_digest TEXT NOT NULL);`}, {16, `ALTER TABLE confirmation_tokens ADD COLUMN command_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE confirmation_tokens ADD COLUMN idempotency_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE confirmation_tokens ADD COLUMN reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE confirmation_tokens ADD COLUMN before_digest TEXT NOT NULL DEFAULT '';`}, {17, `ALTER TABLE submission_decisions ADD COLUMN applied_rule_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE decision_records ADD COLUMN applied_rule_id TEXT NOT NULL DEFAULT '';
+CREATE TABLE policy_bootstrap_observations (observation_id INTEGER PRIMARY KEY, observed_at INTEGER NOT NULL, source_digest TEXT NOT NULL, source_count INTEGER NOT NULL, outcome TEXT NOT NULL);`}}
 	for _, migration := range migrations {
 		version := migration.version
 		var exists int

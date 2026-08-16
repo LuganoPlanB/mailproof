@@ -29,6 +29,7 @@ import (
 	"github.com/luganoplanb/mailproof/internal/analyzers"
 	"github.com/luganoplanb/mailproof/internal/artifact"
 	"github.com/luganoplanb/mailproof/internal/budget"
+	"github.com/luganoplanb/mailproof/internal/control"
 	"github.com/luganoplanb/mailproof/internal/dashboard"
 	"github.com/luganoplanb/mailproof/internal/evidence"
 	"github.com/luganoplanb/mailproof/internal/ingress"
@@ -61,7 +62,7 @@ func exitCode(err error) int {
 }
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: mailproof {version|dashboard|collect|worker|reporter|intel-projector|intel|analytics-projector|analytics|results-api|status|inspect|replay|bundle|verify-report|redeliver|submitter|admission}")
+		return errors.New("usage: mailproof {version|dashboard|control-api|collect|worker|reporter|intel-projector|intel|analytics-projector|analytics|results-api|status|inspect|replay|bundle|verify-report|redeliver|submitter|admission}")
 	}
 	switch args[0] {
 	case "version":
@@ -84,6 +85,8 @@ func run(ctx context.Context, args []string) error {
 		return resultsAPI(ctx, args[1:])
 	case "dashboard":
 		return dashboardCommand(ctx, args[1:])
+	case "control-api":
+		return controlAPI(ctx, args[1:])
 	case "status":
 		return status(ctx, args[1:])
 	case "inspect":
@@ -479,6 +482,85 @@ func analyticsCommand(ctx context.Context, args []string) error {
 	return emitStatus("analytics retain", "completed", 0)
 }
 
+func controlAPI(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("control-api", flag.ContinueOnError)
+	listen := fs.String("listen", "127.0.0.1:8081", "loopback-only internal HTTP listen address")
+	state := fs.String("state", "/state/mailproof.sqlite", "SQLite state database")
+	tokenFile := fs.String("token-file", "/runtime/secrets/control-api-token", "0600 bearer token file")
+	confirmationFile := fs.String("confirmation-key-file", "/runtime/secrets/control-confirmation-hmac-key", "0600 confirmation HMAC key file")
+	capabilityFile := fs.String("capability-key-file", "/runtime/secrets/capability-hmac-key", "0600 capability HMAC key file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := controlLoopbackAddress(*listen); err != nil {
+		return err
+	}
+	readKey := func(path, name string) ([]byte, error) {
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, fmt.Errorf("stat %s: %w", name, err)
+		}
+		if info.Mode().Perm()&0o077 != 0 {
+			return nil, errors.New(name + " must not be group or world readable")
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", name, err)
+		}
+		b = bytes.TrimSpace(b)
+		if len(b) < 32 {
+			return nil, errors.New(name + " is too short")
+		}
+		return b, nil
+	}
+	token, err := readKey(*tokenFile, "control API token")
+	if err != nil {
+		return err
+	}
+	confirmation, err := readKey(*confirmationFile, "confirmation HMAC key")
+	if err != nil {
+		return err
+	}
+	capability, err := readKey(*capabilityFile, "capability HMAC key")
+	if err != nil {
+		return err
+	}
+	db, err := queue.Open(ctx, *state)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	server := &http.Server{Addr: *listen, Handler: control.API{Service: control.Service{DB: db, ConfirmationKey: confirmation, CapabilityKey: capability, CapabilityDomain: "mailproof.test"}, Token: token}.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdown)
+	}()
+	err = server.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return fmt.Errorf("serve control API: %w", err)
+}
+
+// controlLoopbackAddress protects bearer-authenticated control endpoints from
+// accidental exposure outside the local host.
+func controlLoopbackAddress(address string) error {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil || host == "" || port == "" {
+		return errors.New("control API listen address must be a loopback host and port")
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		return errors.New("control API listen address has an invalid port")
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return errors.New("control API must bind only to a loopback address")
+	}
+	return nil
+}
+
 func resultsAPI(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("results-api", flag.ContinueOnError)
 	state := fs.String("state", "/state/mailproof.sqlite", "SQLite state database")
@@ -545,12 +627,17 @@ func admissionCommand(ctx context.Context, args []string) error {
 		return err
 	}
 	defer db.Close()
+	policies := &admission.SnapshotStore{DB: db}
+	if err := policies.Refresh(ctx); err != nil {
+		return fmt.Errorf("load admission policy snapshot: %w", err)
+	}
+	go policies.Poll(ctx)
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return fmt.Errorf("listen admission policy: %w", err)
 	}
 	defer listener.Close()
-	return (admission.Server{Service: admission.Service{DB: db, CapabilityKey: cap, StampKey: stamp, Domain: *domain, Resolver: admission.DNSResolver{Server: "unbound:53", Timeout: 2 * time.Second}}, MaxConnections: 32}).Serve(ctx, listener)
+	return (admission.Server{Service: admission.Service{DB: db, CapabilityKey: cap, StampKey: stamp, Domain: *domain, Resolver: admission.DNSResolver{Server: "unbound:53", Timeout: 2 * time.Second}, PolicyStore: policies}, MaxConnections: 32}).Serve(ctx, listener)
 }
 
 // postfixMailer is the concrete adapter; enrollment itself only knows Mailer.
@@ -817,10 +904,16 @@ func collect(ctx context.Context, args []string) error {
 		return err
 	}
 	defer db.Close()
-	subjectAllowlist, err := readAllowlist(*subjectAllowlistPath)
-	if err != nil {
-		return err
+	if *subjectAllowlistPath != "" {
+		if err := admission.BootstrapImport(ctx, db, *subjectAllowlistPath, time.Now().UTC()); err != nil {
+			return fmt.Errorf("bootstrap selected subject policy: %w", err)
+		}
 	}
+	policies := &admission.SnapshotStore{DB: db}
+	if err := policies.Refresh(ctx); err != nil {
+		return fmt.Errorf("load collector policy snapshot: %w", err)
+	}
+	go policies.Poll(ctx)
 	ok, err := queue.AcquireCollectorLease(ctx, db, owner, time.Now(), 30*time.Second)
 	if err != nil {
 		return err
@@ -838,7 +931,7 @@ func collect(ctx context.Context, args []string) error {
 		if !ok {
 			return errors.New("collector lease lost")
 		}
-		if err := collectOnce(ctx, db, *source, *artifacts, *logs, *registry, *stampKeyPath, subjectAllowlist); err != nil {
+		if err := collectOnce(ctx, db, *source, *artifacts, *logs, *registry, *stampKeyPath, policies); err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return emitStatus("collect", "stopped", sweeps)
 			}
@@ -858,7 +951,7 @@ func collect(ctx context.Context, args []string) error {
 		}
 	}
 }
-func collectOnce(ctx context.Context, db *sql.DB, source, artifacts, logPath, registryPath, stampKeyPath string, subjectAllowlist []string) error {
+func collectOnce(ctx context.Context, db *sql.DB, source, artifacts, logPath, registryPath, stampKeyPath string, policies *admission.SnapshotStore) error {
 	entries, err := os.ReadDir(source)
 	if err != nil {
 		return fmt.Errorf("read Maildir: %w", err)
@@ -951,13 +1044,13 @@ func collectOnce(ctx context.Context, db *sql.DB, source, artifacts, logPath, re
 			return fmt.Errorf("read sealed selected subject: %w", readErr)
 		}
 		selectedFrom, selectedErr := admission.SelectedSubjectFrom(selected)
-		_, allowed := admission.SelectedSubjectAllowed(selectedFrom, subjectAllowlist)
-		if selectedErr != nil || !allowed {
+		preflight := admission.Preflight(policies.Snapshot(), selectedFrom, nil, time.Now().UTC())
+		if selectedErr != nil || !preflight.Allowed {
 			decisionID, idErr := randomID()
 			if idErr != nil {
 				return idErr
 			}
-			if err := queue.RecordAdmittedRejectedCollection(ctx, db, deliveryID, digest, sourceKey, decisionID, "selected_subject_sender_denied", destination, time.Now()); err != nil {
+			if err := queue.RecordAdmittedRejectedCollectionWithPolicyRule(ctx, db, deliveryID, digest, sourceKey, decisionID, "selected_subject_sender_denied", destination, preflight.PolicyVersion, preflight.RuleID, time.Now()); err != nil {
 				return err
 			}
 			if err := queue.EnqueueVerifiedRejectionNotification(ctx, db, decision.ID, deliveryID, decisionID+"-notify", time.Now()); err != nil {
@@ -974,23 +1067,6 @@ func collectOnce(ctx context.Context, db *sql.DB, source, artifacts, logPath, re
 		}
 	}
 	return nil
-}
-
-func readAllowlist(path string) ([]string, error) {
-	if path == "" {
-		return []string{}, nil
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read selected subject allowlist: %w", err)
-	}
-	values := []string{}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
-			values = append(values, line)
-		}
-	}
-	return values, nil
 }
 
 func headerPrefix(message []byte) []string {

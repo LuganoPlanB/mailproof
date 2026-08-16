@@ -3,19 +3,29 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/luganoplanb/mailproof/internal/admission"
 	"github.com/luganoplanb/mailproof/internal/queue"
 )
+
+type testSPF struct{}
+
+func (testSPF) Check(context.Context, string, string, net.IP) (string, error) { return "pass", nil }
 
 func TestStatusRequiresJSON(t *testing.T) {
 	if err := run(context.Background(), []string{"status"}); err == nil {
@@ -34,6 +44,27 @@ func TestDashboardLoopbackHost(t *testing.T) {
 		if got := dashboardLoopbackHost(tc.host); got != tc.want {
 			t.Errorf("%s = %t", tc.host, got)
 		}
+	}
+}
+
+func TestControlAPIRequiresLoopbackBinding(t *testing.T) {
+	for _, tc := range []struct {
+		address string
+		wantOK  bool
+	}{
+		{"127.0.0.1:8081", true},
+		{"[::1]:8081", true},
+		{":8081", false},
+		{"0.0.0.0:8081", false},
+		{"192.0.2.1:8081", false},
+		{"dashboard.example.test:8081", false},
+	} {
+		t.Run(tc.address, func(t *testing.T) {
+			err := controlLoopbackAddress(tc.address)
+			if (err == nil) != tc.wantOK {
+				t.Fatalf("controlLoopbackAddress(%q) = %v", tc.address, err)
+			}
+		})
 	}
 }
 
@@ -186,6 +217,82 @@ func TestCollectOnceEmptyMaildir(t *testing.T) {
 	}
 	if err := run(context.Background(), []string{"collect", "--once", "--source", source, "--artifacts", filepath.Join(dir, "artifacts"), "--state", filepath.Join(dir, "state.sqlite")}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCollectSelectedSubjectPolicyDenySkipsAnalyzer(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	state := filepath.Join(dir, "state.sqlite")
+	source := filepath.Join(dir, "new")
+	artifacts := filepath.Join(dir, "artifacts")
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	key := []byte("01234567890123456789012345678901")
+	db, err := queue.Open(ctx, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capability := base64.RawURLEncoding.EncodeToString([]byte("abcdefghijklmnopqrstuvwxyz012345"))
+	h := hmac.New(sha256.New, key)
+	_, _ = h.Write([]byte(capability))
+	if _, err = db.ExecContext(ctx, `INSERT INTO submitters(submitter_id,canonical_address,status,created_at,policy_version,minute_limit,hour_limit,day_limit) VALUES('s','wrapper@example.test','active',?,'v1',2,2,2)`, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.ExecContext(ctx, `INSERT INTO submission_capabilities(capability_id,submitter_id,digest,key_id,activated_at) VALUES('c','s',?,'v1',?)`, h.Sum(nil), time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.ExecContext(ctx, `INSERT INTO policy_versions(version,created_at,command_id,digest) VALUES(1,?,'block','x'); INSERT INTO policy_rules(rule_id,version,rule_type,subject,value,created_at) VALUES('subject-rule',1,'subject_domain_block_put','','blocked.example',?)`, time.Now().Unix(), time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := admission.LoadPolicySnapshot(ctx, db, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := admission.Service{DB: db, CapabilityKey: key, StampKey: key, Domain: "mailproof.test", Resolver: testSPF{}, Policy: policy}
+	decision, err := svc.Admit(ctx, admission.Request{RequestType: "smtpd_access_policy", QueueID: "Q1", ProtocolState: "RCPT", ClientAddress: "192.0.2.1", Helo: "mx.example.test", Sender: "wrapper@example.test", Recipient: "verify+" + capability + "@mailproof.test"})
+	if err != nil {
+		t.Fatalf("Admit() = (%+v, %v)", decision, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	message := "Received: from x by postfix.mailproof.test id=Q1\r\nX-Mailproof-Admission: " + decision.Stamp + "\r\nFrom: wrapper@example.test\r\nContent-Type: multipart/mixed; boundary=boundary\r\n\r\n--boundary\r\nContent-Type: message/rfc822\r\n\r\nFrom: selected@blocked.example\r\nSubject: denied\r\n\r\nbody\r\n--boundary--\r\n"
+	if err := os.WriteFile(filepath.Join(source, "message"), []byte(message), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stampFile := filepath.Join(dir, "stamp")
+	if err := os.WriteFile(stampFile, key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(ctx, []string{"collect", "--once", "--source", source, "--artifacts", artifacts, "--state", state, "--admission-stamp-key", stampFile}); err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ }))
+	defer server.Close()
+	if err := run(ctx, []string{"worker", "--drain", "--state", state, "--artifacts", artifacts, "--rspamd", server.URL}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("analyzer calls=%d, want 0", calls)
+	}
+	db, err = queue.Open(ctx, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var runs int
+	if err := db.QueryRow("SELECT COUNT(*) FROM runs").Scan(&runs); err != nil || runs != 0 {
+		t.Fatalf("runs=%d, %v", runs, err)
+	}
+	var provenance string
+	if err := db.QueryRow("SELECT policy_version FROM decision_records WHERE reason_code='selected_subject_sender_denied'").Scan(&provenance); err != nil || provenance != "v1" {
+		t.Fatalf("preflight provenance=%q, %v", provenance, err)
+	}
+	if err := db.QueryRow("SELECT applied_rule_id FROM decision_records WHERE reason_code='selected_subject_sender_denied'").Scan(&provenance); err != nil || provenance != "subject-rule" {
+		t.Fatalf("preflight rule provenance=%q, %v", provenance, err)
 	}
 }
 
