@@ -55,6 +55,15 @@ state.
 Use the enrollment, recovery, and API procedures in the
 [sender and analytics runbook](docs/runbooks/backup-restore.md#submitter-enrollment-and-recovery).
 
+## Private dashboard
+
+The optional v1 dashboard is a private, unauthenticated local operator console,
+not a public website. Start it with `docker compose --profile dashboard up -d
+--wait` and browse `http://localhost:3000`, or use an SSH tunnel to preserve the
+loopback boundary. See the [dashboard operations runbook](docs/runbooks/dashboard.md)
+for safe access, projections/campaigns, policy controls, recovery, privacy, and
+the future passkey handoff.
+
 ## Architecture
 
 ```mermaid
@@ -224,9 +233,9 @@ is in the [work orchestration runbook](docs/runbooks/work-orchestration.md).
 ## Backup and recovery
 
 Authoritative state includes Maildir, sealed artifacts, SQLite and its WAL,
-restricted Postfix ingress logs, the submitter registry, signing keys, and
-committed configuration. Backups contain sensitive correlation data and
-private keys and must be encrypted at rest.
+restricted Postfix ingress logs, the submitter registry, dashboard/control and
+projection keys, signing keys, and committed configuration. Backups contain
+sensitive correlation data and private keys and must be encrypted at rest.
 
 Always preview backup and restore operations:
 

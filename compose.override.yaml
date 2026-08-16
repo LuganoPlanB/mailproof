@@ -56,6 +56,18 @@ services:
   results-api:
     build: *mailproof-build
 
+  analytics-projector:
+    build: *mailproof-build
+
+  intel-projector:
+    build: *mailproof-build
+
+  dashboard:
+    build: *mailproof-build
+
+  control-api:
+    build: *mailproof-build
+
   smoke:
     build:
       context: .

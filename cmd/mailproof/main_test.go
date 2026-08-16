@@ -47,22 +47,22 @@ func TestDashboardLoopbackHost(t *testing.T) {
 	}
 }
 
-func TestControlAPIRequiresLoopbackBinding(t *testing.T) {
+func TestControlAPIRequiresPrivateBinding(t *testing.T) {
 	for _, tc := range []struct {
 		address string
 		wantOK  bool
 	}{
 		{"127.0.0.1:8081", true},
 		{"[::1]:8081", true},
-		{":8081", false},
+		{":8081", true},
 		{"0.0.0.0:8081", false},
 		{"192.0.2.1:8081", false},
 		{"dashboard.example.test:8081", false},
 	} {
 		t.Run(tc.address, func(t *testing.T) {
-			err := controlLoopbackAddress(tc.address)
+			err := controlListenAddress(tc.address)
 			if (err == nil) != tc.wantOK {
-				t.Fatalf("controlLoopbackAddress(%q) = %v", tc.address, err)
+				t.Fatalf("controlListenAddress(%q) = %v", tc.address, err)
 			}
 		})
 	}

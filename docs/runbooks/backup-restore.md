@@ -2,7 +2,8 @@
 
 Authoritative state is the Maildir, immutable artifact tree, SQLite database and
 WAL, restricted Postfix ingress log, runtime token registry, submitter rows,
-capability and admission-stamp HMAC keys, signing keys, and
+capability and admission-stamp HMAC keys, dashboard session/results/control API
+tokens, confirmation and indicator-HMAC keys, report-verification/signing keys, and
 committed configuration. Redis and Unbound are disposable caches and are never
 backed up. Treat every backup as secret material: it contains recipient
 correlation and private keys.
@@ -52,7 +53,9 @@ run the rotate dry-run then `submitter rotate --id ID --confirm --json`; the old
 address immediately stops working. Never edit SQLite or runtime JSON manually.
 
 `/runtime/secrets` is an authoritative backup input and contains distinct
-`capability-hmac-key` and `admission-stamp-hmac-key` files. Back them up only
+`capability-hmac-key`, `admission-stamp-hmac-key`, `dashboard-session-hmac-key`,
+`results-api-token`, `control-api-token`, `control-confirmation-hmac-key`, and
+`indicator-hmac-key` files. Back them up only
 through `scripts/backup.sh`. If a key is lost, restore it from the verified
 backup before startup. If the capability key cannot be recovered, revoke and
 re-enroll affected submitters: keyed digests cannot be recovered or re-keyed.
