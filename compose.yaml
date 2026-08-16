@@ -177,7 +177,9 @@ services:
   analytics-projector:
     image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-app"
     command: ["analytics-projector", "--watch"]
-    depends_on: {init: {condition: service_completed_successfully}}
+    depends_on:
+      init: {condition: service_completed_successfully}
+      results-api: {condition: service_healthy}
     network_mode: none
     volumes: [state:/state]
     <<: [*hardening, *resources]
@@ -188,7 +190,9 @@ services:
   intel-projector:
     image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-app"
     command: ["intel-projector", "--watch"]
-    depends_on: {init: {condition: service_completed_successfully}}
+    depends_on:
+      init: {condition: service_completed_successfully}
+      results-api: {condition: service_healthy}
     network_mode: none
     volumes:
       - state:/state
