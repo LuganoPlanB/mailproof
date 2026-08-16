@@ -414,36 +414,36 @@ func (s Service) Admit(ctx context.Context, r Request) (Decision, error) {
 		return Decision{}, ErrDeferred
 	}
 	if rule, blocked := snapshot.BlockedPeer(r.ClientAddress, s.now()); blocked {
-		return s.reject(ctx, r, "policy", "peer_blocked", "", snapshot.Version, rule.ID), ErrDenied
+		return s.reject(ctx, r, "policy", "peer_blocked", "", snapshot.Version, rule.ID)
 	}
 	envelope, err := submitter.CanonicalAddress(r.Sender)
 	if err != nil {
-		return s.reject(ctx, r, "identity", "invalid_sender", "", 0, ""), ErrDenied
+		return s.reject(ctx, r, "identity", "invalid_sender", "", 0, "")
 	}
 	if rule, blocked := snapshot.BlockedOuter(strings.Split(envelope, "@")[1], s.now()); blocked {
-		return s.reject(ctx, r, "policy", "outer_domain_blocked", "", snapshot.Version, rule.ID), ErrDenied
+		return s.reject(ctx, r, "policy", "outer_domain_blocked", "", snapshot.Version, rule.ID)
 	}
 	cap, err := capability(r.Recipient, s.Domain)
 	if err != nil {
-		return s.reject(ctx, r, "identity", "invalid_capability", "", 0, ""), ErrDenied
+		return s.reject(ctx, r, "identity", "invalid_capability", "", 0, "")
 	}
 	digest := keyed(s.CapabilityKey, cap)
 	item, ok := snapshot.Submitters[hex.EncodeToString(digest)]
 	if !ok || item.Status != "active" {
-		return s.reject(ctx, r, "identity", "unknown_capability", "", 0, ""), ErrDenied
+		return s.reject(ctx, r, "identity", "unknown_capability", "", 0, "")
 	}
 	if envelope != item.Address {
-		return s.reject(ctx, r, "identity", "envelope_mismatch", item.ID, 0, ""), ErrDenied
+		return s.reject(ctx, r, "identity", "envelope_mismatch", item.ID, 0, "")
 	}
 	spf, err := s.Resolver.Check(ctx, envelope, r.Helo, net.ParseIP(r.ClientAddress))
 	if err != nil {
 		return Decision{}, ErrDeferred
 	}
 	if spf != "pass" {
-		return s.reject(ctx, r, "spf", "spf_"+spf, item.ID, 0, ""), ErrDenied
+		return s.reject(ctx, r, "spf", "spf_"+spf, item.ID, 0, "")
 	}
 	if item.Minute < 1 || item.Hour < 1 || item.Day < 1 {
-		return s.reject(ctx, r, "quota", "invalid_limit", item.ID, 0, ""), ErrDenied
+		return s.reject(ctx, r, "quota", "invalid_limit", item.ID, 0, "")
 	}
 	return s.admit(ctx, r, item.ID, envelope, fmt.Sprintf("v%d", snapshot.Version), digest, item.Minute, item.Hour, item.Day)
 }
@@ -519,10 +519,10 @@ func (s Service) admit(ctx context.Context, r Request, submitterID, envelope, po
 	}
 	return d, nil
 }
-func (s Service) reject(ctx context.Context, r Request, stage, reason, submitterID string, policyVersion int64, ruleID string) Decision {
+func (s Service) reject(ctx context.Context, r Request, stage, reason, submitterID string, policyVersion int64, ruleID string) (Decision, error) {
 	id, err := decisionID()
 	if err != nil {
-		return Decision{Stage: stage, Reason: reason}
+		return Decision{}, ErrDeferred
 	}
 	version := "v1"
 	if policyVersion > 0 {
@@ -530,11 +530,17 @@ func (s Service) reject(ctx context.Context, r Request, stage, reason, submitter
 	}
 	d := Decision{ID: id, SubmitterID: submitterID, Envelope: r.Sender, Recipient: r.Recipient, Stage: stage, Reason: reason, PolicyVersion: version, PolicyRuleID: ruleID}
 	tx, err := s.DB.BeginTx(ctx, nil)
-	if err == nil {
-		_ = s.store(ctx, tx, d, r, nil, s.now())
-		_ = tx.Commit()
+	if err != nil {
+		return Decision{}, ErrDeferred
 	}
-	return d
+	defer tx.Rollback()
+	if err = s.store(ctx, tx, d, r, nil, s.now()); err != nil {
+		return Decision{}, ErrDeferred
+	}
+	if err = tx.Commit(); err != nil {
+		return Decision{}, ErrDeferred
+	}
+	return d, ErrDenied
 }
 func (s Service) store(ctx context.Context, tx *sql.Tx, d Decision, r Request, digest []byte, now time.Time) error {
 	_, err := tx.ExecContext(ctx, `INSERT INTO submission_decisions(decision_id,submitter_id,capability_digest,envelope_sender,recipient,peer_ip,helo,spf_outcome,stage,reason_code,policy_version,applied_rule_id,queue_id,stamp_mac,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, d.ID, nilOr(d.SubmitterID), digest, d.Envelope, d.Recipient, r.ClientAddress, r.Helo, d.SPF, d.Stage, d.Reason, d.PolicyVersion, d.PolicyRuleID, r.QueueID, keyed(s.StampKey, d.Stamp), nullUnix(d.ExpiresAt), now.Unix())

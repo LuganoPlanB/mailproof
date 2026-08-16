@@ -148,6 +148,33 @@ func TestAdmitDefersWithoutValidatedSnapshot(t *testing.T) {
 	}
 }
 
+func TestAdmitDefersWhenRejectionCannotBePersisted(t *testing.T) {
+	db, err := queue.Open(context.Background(), ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	key := []byte("01234567890123456789012345678901")
+	svc := Service{
+		DB:            db,
+		CapabilityKey: key,
+		StampKey:      key,
+		Domain:        "mailproof.test",
+		Resolver:      passSPF{},
+		Policy:        &PolicySnapshot{OuterDomains: map[string]PolicyRule{}},
+	}
+	request := Request{ClientAddress: "192.0.2.1", Sender: "invalid", Recipient: "verify@example.test"}
+	decision, err := svc.Admit(context.Background(), request)
+	if !errors.Is(err, ErrDeferred) {
+		t.Fatalf("Admit() error = %v, want ErrDeferred", err)
+	}
+	if decision.ID != "" {
+		t.Fatalf("Admit() decision = %+v, want no unpersisted decision", decision)
+	}
+}
+
 func TestSnapshotStorePollConvergesToNewVersion(t *testing.T) {
 	db, err := queue.Open(context.Background(), ":memory:")
 	if err != nil {
