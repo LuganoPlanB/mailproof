@@ -6,7 +6,8 @@ require (
 	github.com/SCKelemen/unicode/v6 v6.2.0
 	github.com/emersion/go-message v0.18.2
 	github.com/emersion/go-smtp v0.25.0
-	github.com/miekg/dns v1.1.68
+	github.com/migadu/spf v1.0.0
+	github.com/miekg/dns v1.1.72
 	golang.org/x/net v0.56.0
 	modernc.org/sqlite v1.44.1
 )
