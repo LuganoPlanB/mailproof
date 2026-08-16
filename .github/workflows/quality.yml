@@ -68,7 +68,7 @@ jobs:
       - name: Build and start the complete graph
         run: |
           docker compose --env-file config/versions.env --profile smoke --profile dashboard build --pull
-          docker compose --env-file config/versions.env --profile dashboard up -d --wait
+          MAILPROOF_DASHBOARD_PUBLIC_ORIGIN=http://127.0.0.1:3000 docker compose --env-file config/versions.env --profile dashboard up -d --wait
       - name: Validate Rspamd configuration and smoke delivery
         run: |
           docker compose exec -T rspamd rspamadm configtest
@@ -85,7 +85,9 @@ jobs:
         run: |
           npm --prefix tests/browser ci
           npx --prefix tests/browser playwright install --with-deps chromium
-          DASHBOARD_URL=http://127.0.0.1:3000 npm --prefix tests/browser test -- compose.spec.js
+          dashboard_address=$(docker compose --env-file config/versions.env --profile dashboard port dashboard 3000)
+          test -n "${dashboard_address}"
+          DASHBOARD_URL="http://${dashboard_address}" npm --prefix tests/browser test -- compose.spec.js
           npm --prefix tests/browser test -- dashboard.spec.js
       - name: Upload redacted browser diagnostics
         if: failure()
