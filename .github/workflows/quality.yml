@@ -87,7 +87,7 @@ jobs:
           dashboard_id=$(docker compose --env-file config/versions.env --profile dashboard ps -q dashboard)
           test -n "${dashboard_id}"
           test "$(docker inspect --format '{{.State.Health.Status}}' "${dashboard_id}")" = healthy
-          docker run --rm --network "container:${dashboard_id}" --env DASHBOARD_URL=http://127.0.0.1:3000 --volume "$PWD/tests/browser:/work" --workdir /work mcr.microsoft.com/playwright:v1.52.0-noble npx playwright test compose.spec.js
+          docker run --rm --network "container:${dashboard_id}" --env DASHBOARD_URL=http://127.0.0.1:3000 --volume "$PWD/tests/browser:/work" --tmpfs /work/test-results --workdir /work mcr.microsoft.com/playwright:v1.52.0-noble npx playwright test compose.spec.js
           npx --prefix tests/browser playwright install --with-deps chromium
           npm --prefix tests/browser test -- dashboard.spec.js
       - name: Upload redacted browser diagnostics
