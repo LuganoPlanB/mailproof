@@ -116,6 +116,8 @@ func dashboardCommand(ctx context.Context, args []string) error {
 	resultsURL := fs.String("results-url", "", "internal results API origin")
 	resultsTokenFile := fs.String("results-token-file", "", "results API bearer token file")
 	sessionKeyFile := fs.String("session-key-file", "", "dashboard session MAC key file")
+	controlURL := fs.String("control-url", "", "internal control API origin")
+	controlTokenFile := fs.String("control-token-file", "", "control API bearer token file")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -145,7 +147,22 @@ func dashboardCommand(ctx context.Context, args []string) error {
 	if err != nil || len(key) < 32 {
 		return errors.New("dashboard session key must contain at least 32 bytes")
 	}
-	server := &http.Server{Addr: net.JoinHostPort(*host, strconv.Itoa(*port)), Handler: dashboard.NewWithConfig(dashboard.ResultsClient{BaseURL: base, Token: bytes.TrimSpace(token)}, dashboard.Config{PublicOrigin: browserOrigin, SessionKey: key}), ReadHeaderTimeout: 2 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+	config := dashboard.Config{PublicOrigin: browserOrigin, SessionKey: key}
+	if (*controlURL == "") != (*controlTokenFile == "") {
+		return errors.New("dashboard control URL and token must be configured together")
+	}
+	if *controlURL != "" {
+		u, e := url.Parse(*controlURL)
+		if e != nil || u.Scheme == "" || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+			return errors.New("dashboard control URL must be an origin")
+		}
+		t, e := os.ReadFile(*controlTokenFile)
+		if e != nil || len(t) < 32 {
+			return errors.New("dashboard control token must contain at least 32 bytes")
+		}
+		config.Control = dashboard.ControlClient{BaseURL: u, Token: bytes.TrimSpace(t)}
+	}
+	server := &http.Server{Addr: net.JoinHostPort(*host, strconv.Itoa(*port)), Handler: dashboard.NewWithConfig(dashboard.ResultsClient{BaseURL: base, Token: bytes.TrimSpace(token)}, config), ReadHeaderTimeout: 2 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
 	go func() { <-ctx.Done(); _ = server.Shutdown(context.Background()) }()
 	err = server.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
