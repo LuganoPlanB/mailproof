@@ -110,7 +110,7 @@ services:
     tmpfs: [/tmp]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "test -f /state/mailproof.sqlite || test -d /artifacts"]
+      test: ["CMD-SHELL", "test -f /state/mailproof.sqlite"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -156,7 +156,7 @@ services:
   results-api:
     image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-app"
     command: ["results-api"]
-    depends_on: {init: {condition: service_completed_successfully}}
+    depends_on: {collector: {condition: service_healthy}}
     networks: [analytics]
     volumes:
       - state:/state:ro
@@ -255,7 +255,7 @@ services:
     profiles: [dashboard]
     image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-app"
     command: ["control-api", "--listen=:8081", "--state=/state/mailproof.sqlite", "--token-file=/runtime/secrets/control-api-token", "--confirmation-key-file=/runtime/secrets/control-confirmation-hmac-key", "--capability-key-file=/runtime/secrets/capability-hmac-key"]
-    depends_on: {init: {condition: service_completed_successfully}}
+    depends_on: {collector: {condition: service_healthy}}
     networks: [management]
     volumes:
       - state:/state
