@@ -11,7 +11,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 type failingReader struct{}
@@ -178,7 +180,7 @@ func TestResultsClientRequestsOnlyServerCredentials(t *testing.T) {
 			t.Fatal("missing bounded range")
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"schema_version":1,"values":[],"generated_at":"2026-08-15T00:00:00Z","data_through":"2026-08-15T00:00:00Z","observed_at":"2026-08-15T00:00:00Z","partial":false,"stale":false}`))
+		_, _ = w.Write([]byte(`{"schema_version":1,"filters":{"From":"2026-08-14T00:00:00Z","To":"2026-08-15T00:00:00Z","Interval":"hour","Metric":"","Dimension":"","Series":null,"Cards":null},"values":[],"buckets":[{"start":"2026-08-14T00:00:00Z","values":[]}],"generated_at":"2026-08-15T00:00:00Z","data_through":"2026-08-15T00:00:00Z","observed_at":"2026-08-15T00:00:00Z","high_watermark":17,"projection_lag_seconds":3,"p95_latency_ms":42,"latency_known":true,"partial":false,"stale":false}`))
 	}))
 	defer server.Close()
 	base, err := url.Parse(server.URL)
@@ -186,8 +188,32 @@ func TestResultsClientRequestsOnlyServerCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := ResultsClient{BaseURL: base, Token: []byte("01234567890123456789012345678901")}
-	if _, err := client.Snapshot(context.Background(), "/v1/dashboard/overview"); err != nil {
+	snapshot, err := client.Snapshot(context.Background(), "/v1/dashboard/overview")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if snapshot.HighWatermark != 17 || snapshot.ProjectionLag != 3 || snapshot.P95LatencyMS != 42 || !snapshot.LatencyKnown || len(snapshot.Buckets) != 1 || !snapshot.Buckets[0].Start.Equal(time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("snapshot = %+v", snapshot)
+	}
+}
+
+func TestManagementAcknowledgementIsServerEnforced(t *testing.T) {
+	handler := managementAcknowledge(&sync.Map{})
+	for _, body := range []string{"command_id=command", "command_id=command&acknowledged=on"} {
+		request := httptest.NewRequest(http.MethodPost, "/policy/ack", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("acknowledgement %q status = %d", body, response.Code)
+		}
+	}
+	request := httptest.NewRequest(http.MethodPost, "/policy/ack", strings.NewReader("command_id=command&acknowledged=yes"))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != "/audit/command" {
+		t.Fatalf("valid acknowledgement = %d %q", response.Code, response.Header().Get("Location"))
 	}
 }
 
@@ -207,6 +233,23 @@ func TestPrivateBoundaryRejectsHostAndSetsStrictCookie(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if cookies := w.Result().Cookies(); len(cookies) != 1 || !cookies[0].HttpOnly || !cookies[0].Secure || cookies[0].SameSite != http.SameSiteStrictMode {
 		t.Fatal("missing strict session cookie")
+	}
+}
+
+func TestPrivateBoundaryRejectsForwardedHeaderFamily(t *testing.T) {
+	origin, _ := url.Parse("https://dashboard.example.test")
+	handler := NewWithConfig(ResultsClient{}, Config{PublicOrigin: origin, SessionKey: []byte("01234567890123456789012345678901")})
+	for _, name := range []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Port", "X-Forwarded-Prefix", "X-Forwarded-Proto", "X-Forwarded-Server", "X-Forwarded-Anything"} {
+		t.Run(name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "https://dashboard.example.test/", nil)
+			request.Host = origin.Host
+			request.Header.Set(name, "attacker-controlled")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("%s status = %d", name, response.Code)
+			}
+		})
 	}
 }
 

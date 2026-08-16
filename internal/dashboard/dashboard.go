@@ -72,7 +72,7 @@ func NewWithConfig(client ResultsClient, config Config) http.Handler {
 
 func boundary(config Config, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Forwarded") != "" || r.Header.Get("X-Forwarded-Host") != "" {
+		if hasForwardedHeader(r.Header) {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
@@ -97,6 +97,16 @@ func boundary(config Config, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func hasForwardedHeader(header http.Header) bool {
+	for name := range header {
+		name = strings.ToLower(name)
+		if name == "forwarded" || strings.HasPrefix(name, "x-forwarded-") {
+			return true
+		}
+	}
+	return false
 }
 
 type sessionIDContextKey struct{}
@@ -327,6 +337,10 @@ func managementConfirm(t *template.Template, c Config, capabilityShown *sync.Map
 }
 func managementAcknowledge(_ *sync.Map) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.FormValue("acknowledged") != "yes" {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
 		commandID, err := required(r.FormValue("command_id"))
 		if err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
