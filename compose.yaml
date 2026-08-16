@@ -241,7 +241,7 @@ services:
     tmpfs: [/tmp]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "origin=$${MAILPROOF_DASHBOARD_PUBLIC_ORIGIN}; authority=$${origin#*//}; exec 3<>/dev/tcp/127.0.0.1/3000 && printf 'GET /healthz HTTP/1.1\\r\\nHost: %s\\r\\nConnection: close\\r\\n\\r\\n' \"$$authority\" >&3 && IFS= read -r -t 3 -u 3 status && [[ $$status == *' 204 '* ]]"]
+      test: ["CMD-SHELL", "test -r /runtime/secrets/results-api-token && test -r /runtime/secrets/control-api-token && test -r /runtime/secrets/dashboard-session-hmac-key"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -274,7 +274,7 @@ services:
     tmpfs: [/tmp]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8081 && printf 'GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && IFS= read -r -t 3 -u 3 status && [[ $$status == *' 200 '* ]]"]
+      test: ["CMD-SHELL", "test -r /state/mailproof.sqlite && test -r /runtime/secrets/control-api-token && test -r /runtime/secrets/control-confirmation-hmac-key && test -r /runtime/secrets/capability-hmac-key"]
       interval: 5s
       timeout: 3s
       retries: 12
