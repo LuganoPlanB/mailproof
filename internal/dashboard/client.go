@@ -203,19 +203,38 @@ func (c ResultsClient) Snapshot(ctx context.Context, route string) (analytics.Sn
 	decoder := json.NewDecoder(io.LimitReader(resp.Body, 2<<20))
 	decoder.DisallowUnknownFields()
 	var response struct {
-		SchemaVersion int               `json:"schema_version"`
-		Values        []analytics.Value `json:"values"`
-		GeneratedAt   time.Time         `json:"generated_at"`
-		DataThrough   time.Time         `json:"data_through"`
-		ObservedAt    time.Time         `json:"observed_at"`
-		Partial       bool              `json:"partial"`
-		Stale         bool              `json:"stale"`
+		SchemaVersion int                `json:"schema_version"`
+		Filters       analytics.Query    `json:"filters"`
+		Values        []analytics.Value  `json:"values"`
+		Buckets       []analytics.Bucket `json:"buckets"`
+		GeneratedAt   time.Time          `json:"generated_at"`
+		DataThrough   time.Time          `json:"data_through"`
+		ObservedAt    time.Time          `json:"observed_at"`
+		HighWatermark int64              `json:"high_watermark"`
+		ProjectionLag int64              `json:"projection_lag_seconds"`
+		P95LatencyMS  int64              `json:"p95_latency_ms"`
+		LatencyKnown  bool               `json:"latency_known"`
+		Partial       bool               `json:"partial"`
+		Stale         bool               `json:"stale"`
 	}
 	if err := decoder.Decode(&response); err != nil {
 		return analytics.Snapshot{}, fmt.Errorf("decode dashboard projection: %w", err)
 	}
-	if decoder.More() || response.SchemaVersion != 1 {
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF || response.SchemaVersion != 1 {
 		return analytics.Snapshot{}, errors.New("invalid dashboard projection")
 	}
-	return analytics.Snapshot{Values: response.Values, GeneratedAt: response.GeneratedAt, DataThrough: response.DataThrough, ObservedAt: response.ObservedAt, Partial: response.Partial, Stale: response.Stale}, nil
+	return analytics.Snapshot{
+		GeneratedAt:   response.GeneratedAt,
+		DataThrough:   response.DataThrough,
+		ObservedAt:    response.ObservedAt,
+		HighWatermark: response.HighWatermark,
+		ProjectionLag: response.ProjectionLag,
+		P95LatencyMS:  response.P95LatencyMS,
+		LatencyKnown:  response.LatencyKnown,
+		Partial:       response.Partial,
+		Stale:         response.Stale,
+		Values:        response.Values,
+		Buckets:       response.Buckets,
+	}, nil
 }
