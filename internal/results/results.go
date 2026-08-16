@@ -55,8 +55,10 @@ func InsertRecord(ctx context.Context, db *sql.DB, r Record) error {
 		return fmt.Errorf("result rows affected: %w", err)
 	}
 	if n == 1 {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO intel_projection_outbox(run_id,manifest_path,manifest_digest,created_at) VALUES(?,?,?,?)`, r.RunID, r.ManifestPath, r.ManifestDigest, time.Now().UTC().Unix()); err != nil {
-			return fmt.Errorf("enqueue intel projection: %w", err)
+		if campaignEligible(r) {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO intel_projection_outbox(run_id,manifest_path,manifest_digest,created_at) VALUES(?,?,?,?)`, r.RunID, r.ManifestPath, r.ManifestDigest, time.Now().UTC().Unix()); err != nil {
+				return fmt.Errorf("enqueue intel projection: %w", err)
+			}
 		}
 		return tx.Commit()
 	}
@@ -71,6 +73,18 @@ func InsertRecord(ctx context.Context, db *sql.DB, r Record) error {
 		return tx.Commit()
 	}
 	return errors.New("conflicting immutable result record")
+}
+
+func campaignEligible(r Record) bool {
+	if r.Verdict != "FAILED" {
+		return false
+	}
+	switch r.CategorySummary {
+	case "phishing", "impersonation", "malicious-link", "malicious-attachment":
+		return true
+	default:
+		return false
+	}
 }
 
 type Decision struct {
@@ -152,7 +166,7 @@ func (r Repository) Summary(ctx context.Context, from, to time.Time, interval st
 	if interval == "day" {
 		format = "%Y-%m-%dT00:00:00Z"
 	}
-	rows, err := r.DB.QueryContext(ctx, `SELECT bucket,kind,COUNT(*) FROM (SELECT strftime(?,occurred_at,'unixepoch') AS bucket,verdict AS kind FROM result_records WHERE occurred_at>=? AND occurred_at<=? UNION ALL SELECT strftime(?,occurred_at,'unixepoch'),outcome||':'||stage||':'||reason_code FROM decision_records WHERE occurred_at>=? AND occurred_at<=?) GROUP BY bucket,kind ORDER BY bucket,kind`, format, from.UTC().Unix(), to.UTC().Unix(), format, from.UTC().Unix(), to.UTC().Unix())
+	rows, err := r.DB.QueryContext(ctx, `SELECT bucket,kind,COUNT(*) FROM (SELECT strftime(?,occurred_at,'unixepoch') AS bucket,verdict AS kind FROM result_records WHERE occurred_at>=? AND occurred_at<? UNION ALL SELECT strftime(?,occurred_at,'unixepoch'),outcome||':'||stage||':'||reason_code FROM decision_records WHERE occurred_at>=? AND occurred_at<?) GROUP BY bucket,kind ORDER BY bucket,kind`, format, from.UTC().Unix(), to.UTC().Unix(), format, from.UTC().Unix(), to.UTC().Unix())
 	if err != nil {
 		return nil, fmt.Errorf("summary query: %w", err)
 	}
@@ -188,7 +202,7 @@ func (r Repository) validate(f Filter) (int, error) {
 	if n == 0 {
 		n = 50
 	}
-	if n < 1 || n > MaxPageSize || (!f.From.IsZero() && !f.To.IsZero() && (f.To.Before(f.From) || f.To.Sub(f.From) > maxRange)) || len(f.Cursor) > 1024 || len(f.ID) > 256 || len(f.SubmitterID) > 256 || len(f.Outcome) > 64 || len(f.Stage) > 64 || len(f.Reason) > 128 || len(f.Verdict) > 64 || len(f.PolicyVersion) > 64 || len(f.SubjectDomain) > 253 {
+	if n < 1 || n > MaxPageSize || (!f.From.IsZero() && !f.To.IsZero() && (!f.To.After(f.From) || f.To.Sub(f.From) > maxRange)) || len(f.Cursor) > 1024 || len(f.ID) > 256 || len(f.SubmitterID) > 256 || len(f.Outcome) > 64 || len(f.Stage) > 64 || len(f.Reason) > 128 || len(f.Verdict) > 64 || len(f.PolicyVersion) > 64 || len(f.SubjectDomain) > 253 {
 		return 0, ErrInvalidQuery
 	}
 	return n, nil
@@ -245,7 +259,7 @@ func (r Repository) Results(ctx context.Context, f Filter) (Page[Record], error)
 		args = append(args, f.From.UTC().Unix())
 	}
 	if !f.To.IsZero() {
-		where = append(where, "occurred_at<=?")
+		where = append(where, "occurred_at<?")
 		args = append(args, f.To.UTC().Unix())
 	}
 	if f.Cursor != "" {
@@ -308,7 +322,7 @@ func (r Repository) Decisions(ctx context.Context, f Filter) (Page[Decision], er
 		args = append(args, f.From.UTC().Unix())
 	}
 	if !f.To.IsZero() {
-		where = append(where, "occurred_at<=?")
+		where = append(where, "occurred_at<?")
 		args = append(args, f.To.UTC().Unix())
 	}
 	if f.Cursor != "" {
