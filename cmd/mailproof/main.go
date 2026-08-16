@@ -132,8 +132,8 @@ func dashboardCommand(ctx context.Context, args []string) error {
 	if origin == "" {
 		origin = "http://localhost:" + strconv.Itoa(*port)
 	}
-	browserOrigin, err := url.Parse(origin)
-	if err != nil || browserOrigin.Scheme == "" || browserOrigin.Host == "" || browserOrigin.User != nil || browserOrigin.Path != "" || browserOrigin.RawQuery != "" || browserOrigin.Fragment != "" || (browserOrigin.Scheme != "https" && !(browserOrigin.Scheme == "http" && browserOrigin.Hostname() == "localhost")) {
+	browserOrigin, err := dashboardPublicOrigin(origin)
+	if err != nil {
 		return errors.New("dashboard public origin must be an allowed absolute origin")
 	}
 	if !dashboardLoopbackHost(*host) && *publicOrigin == "" {
@@ -182,6 +182,14 @@ func dashboardLoopbackHost(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+func dashboardPublicOrigin(origin string) (*url.URL, error) {
+	browserOrigin, err := url.Parse(origin)
+	if err != nil || browserOrigin.Scheme == "" || browserOrigin.Host == "" || browserOrigin.User != nil || browserOrigin.Path != "" || browserOrigin.RawQuery != "" || browserOrigin.Fragment != "" || (browserOrigin.Scheme != "https" && !(browserOrigin.Scheme == "http" && dashboardLoopbackHost(browserOrigin.Hostname()))) {
+		return nil, errors.New("dashboard public origin must be an allowed absolute origin")
+	}
+	return browserOrigin, nil
 }
 
 func intelCommand(ctx context.Context, args []string) error {
