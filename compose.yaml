@@ -172,6 +172,114 @@ services:
       retries: 12
     logging: *logging
 
+  # Projectors have no network path. They own only their bounded projection
+  # writes; intel additionally reads immutable, signature-verified artifacts.
+  analytics-projector:
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-app"
+    command: ["analytics-projector", "--watch"]
+    depends_on: {init: {condition: service_completed_successfully}}
+    network_mode: none
+    volumes: [state:/state]
+    <<: [*hardening, *resources]
+    tmpfs: [/tmp]
+    restart: unless-stopped
+    logging: *logging
+
+  intel-projector:
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-app"
+    command: ["intel-projector", "--watch"]
+    depends_on: {init: {condition: service_completed_successfully}}
+    network_mode: none
+    volumes:
+      - state:/state
+      - artifacts:/artifacts:ro
+      - type: volume
+        source: runtime
+        target: /runtime/secrets/indicator-hmac-key
+        read_only: true
+        volume: {subpath: secrets/indicator-hmac-key}
+      - type: volume
+        source: runtime
+        target: /runtime/secrets/report-verification-key.pem
+        read_only: true
+        volume: {subpath: secrets/report-verification-key.pem}
+    <<: [*hardening, *resources]
+    tmpfs: [/tmp]
+    restart: unless-stopped
+    logging: *logging
+
+  # The browser surface is explicitly opt-in and loopback-published by default.
+  # Neither service joins the public, mail, analyzer, scanner, or report network.
+  dashboard:
+    profiles: [dashboard]
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-app"
+    command: ["dashboard", "--host=0.0.0.0", "--port=3000", "--public-origin=${MAILPROOF_DASHBOARD_PUBLIC_ORIGIN:-http://localhost:3000}", "--results-url=http://results-api:8080", "--results-token-file=/runtime/secrets/results-api-token", "--control-url=http://control-api:8081", "--control-token-file=/runtime/secrets/control-api-token", "--session-key-file=/runtime/secrets/dashboard-session-hmac-key"]
+    depends_on:
+      results-api: {condition: service_healthy}
+      control-api: {condition: service_healthy}
+    ports: ["${MAILPROOF_DASHBOARD_HOST:-127.0.0.1}:${MAILPROOF_DASHBOARD_PORT:-3000}:3000"]
+    environment:
+      MAILPROOF_DASHBOARD_PUBLIC_ORIGIN: ${MAILPROOF_DASHBOARD_PUBLIC_ORIGIN:-http://localhost:3000}
+    networks: [analytics, management]
+    volumes:
+      - type: volume
+        source: runtime
+        target: /runtime/secrets/results-api-token
+        read_only: true
+        volume: {subpath: secrets/results-api-token}
+      - type: volume
+        source: runtime
+        target: /runtime/secrets/control-api-token
+        read_only: true
+        volume: {subpath: secrets/control-api-token}
+      - type: volume
+        source: runtime
+        target: /runtime/secrets/dashboard-session-hmac-key
+        read_only: true
+        volume: {subpath: secrets/dashboard-session-hmac-key}
+    <<: [*hardening, *resources]
+    tmpfs: [/tmp]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "origin=$${MAILPROOF_DASHBOARD_PUBLIC_ORIGIN}; authority=$${origin#*//}; exec 3<>/dev/tcp/127.0.0.1/3000 && printf 'GET /healthz HTTP/1.1\\r\\nHost: %s\\r\\nConnection: close\\r\\n\\r\\n' \"$$authority\" >&3 && IFS= read -r -t 3 -u 3 status && [[ $$status == *' 204 '* ]]"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    logging: *logging
+
+  control-api:
+    profiles: [dashboard]
+    image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-app"
+    command: ["control-api", "--listen=:8081", "--state=/state/mailproof.sqlite", "--token-file=/runtime/secrets/control-api-token", "--confirmation-key-file=/runtime/secrets/control-confirmation-hmac-key", "--capability-key-file=/runtime/secrets/capability-hmac-key"]
+    depends_on: {init: {condition: service_completed_successfully}}
+    networks: [management]
+    volumes:
+      - state:/state
+      - type: volume
+        source: runtime
+        target: /runtime/secrets/control-api-token
+        read_only: true
+        volume: {subpath: secrets/control-api-token}
+      - type: volume
+        source: runtime
+        target: /runtime/secrets/control-confirmation-hmac-key
+        read_only: true
+        volume: {subpath: secrets/control-confirmation-hmac-key}
+      - type: volume
+        source: runtime
+        target: /runtime/secrets/capability-hmac-key
+        read_only: true
+        volume: {subpath: secrets/capability-hmac-key}
+    <<: [*hardening, *resources]
+    tmpfs: [/tmp]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8081 && printf 'GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && IFS= read -r -t 3 -u 3 status && [[ $$status == *' 200 '* ]]"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    logging: *logging
+
   smoke:
     profiles: [smoke]
     image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-smoke"
@@ -291,6 +399,7 @@ networks:
   scanner: {internal: true}
   report: {internal: true}
   analytics: {internal: true}
+  management: {internal: true}
 
 volumes:
   runtime: {}

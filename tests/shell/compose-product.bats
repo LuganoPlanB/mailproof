@@ -30,8 +30,22 @@
   [ "$status" -eq 0 ]
 }
 
+@test "dashboard profile confines browser and control services to their least-privilege networks" {
+  run docker compose --env-file config/versions.env --profile dashboard config --format json
+  [ "$status" -eq 0 ]
+  config=$output
+
+  run python3 -c 'import json, sys; s=json.loads(sys.argv[1])["services"]; analytics=s["analytics-projector"]; intel=s["intel-projector"]; dashboard=s["dashboard"]; control=s["control-api"]; assert analytics["network_mode"] == "none" and "networks" not in analytics; assert intel["network_mode"] == "none" and "networks" not in intel; assert set(dashboard["networks"]) == {"analytics", "management"}; assert set(control["networks"]) == {"management"}; assert dashboard["ports"][0]["host_ip"] == "127.0.0.1"; assert dashboard["ports"][0]["published"] == "3000"; assert "--host=0.0.0.0" in dashboard["command"]; assert "--listen=:8081" in control["command"]; assert all(v.get("read_only") for v in dashboard["volumes"]); assert {v["target"] for v in dashboard["volumes"]} == {"/runtime/secrets/results-api-token", "/runtime/secrets/control-api-token", "/runtime/secrets/dashboard-session-hmac-key"}; assert "/state" not in {v["target"] for v in dashboard["volumes"]}; assert "/artifacts" not in {v["target"] for v in dashboard["volumes"]}; assert not set(dashboard["networks"]) & {"public", "mail", "analyzer", "scanner", "report"}; assert not set(control["networks"]) & {"public", "mail", "analyzer", "scanner", "report"}' "$config"
+  [ "$status" -eq 0 ]
+}
+
 @test "init bootstraps a validated selected-subject policy from deployment configuration" {
   run python3 -c 'from pathlib import Path; compose=Path("compose.yaml").read_text(); init=Path("containers/init/entrypoint.sh").read_text(); env=Path(".env.example").read_text(); assert "MAILPROOF_SUBJECT_SENDER_DOMAIN_ALLOWLIST" in compose; assert "subject-sender-domain-allowlist" in init; assert "MAILPROOF_SUBJECT_SENDER_DOMAIN_ALLOWLIST=lugano.ch" in env; assert "chmod 0600" in init'
+  [ "$status" -eq 0 ]
+}
+
+@test "init provisions separated dashboard and control keys with owner-only modes" {
+  run python3 -c 'from pathlib import Path; text=Path("containers/init/entrypoint.sh").read_text(); names=("control-api-token", "control-confirmation-hmac-key", "dashboard-session-hmac-key", "indicator-hmac-key", "report-verification-key.pem"); assert all(name in text for name in names); assert "openssl pkey" in text; assert "chmod 0600" in text'
   [ "$status" -eq 0 ]
 }
 
@@ -84,7 +98,7 @@
   run python3 -c 'import json, sys; services=json.loads(sys.argv[1])["services"]; assert all("build" not in service for service in services.values()); assert services["collector"]["image"] == "ghcr.io/luganoplanb/mailproof:v9.8.7-app"' "$config"
   [ "$status" -eq 0 ]
 
-  run python3 -c 'from pathlib import Path; dockerfiles={str(p) for p in Path("containers").glob("*/Dockerfile")}; override=Path("compose.override.yaml").read_text(); assert dockerfiles; assert all(path in override for path in dockerfiles); assert "results-api:" in override and "build: *mailproof-build" in override'
+  run python3 -c 'from pathlib import Path; dockerfiles={str(p) for p in Path("containers").glob("*/Dockerfile")}; override=Path("compose.override.yaml").read_text(); assert dockerfiles; assert all(path in override for path in dockerfiles); assert all((name+":") in override for name in ("results-api", "analytics-projector", "intel-projector", "dashboard", "control-api")); assert "build: *mailproof-build" in override'
   [ "$status" -eq 0 ]
 }
 
@@ -95,6 +109,16 @@
 
 @test "quality skips code jobs for documentation-only changes" {
   run python3 -c 'from pathlib import Path; workflow=Path(".github/workflows/quality.yml").read_text(); assert "Classify software changes" in workflow; assert "scripts/release-eligible.sh" in workflow; assert "if: needs.classify.outputs.software == '\''true'\''" in workflow; assert "needs: [classify, go-and-shell]" in workflow; assert "--profile smoke build --pull" in workflow'
+  [ "$status" -eq 0 ]
+}
+
+@test "remote quality smoke includes the dashboard profile and isolated browser checks" {
+  run python3 -c 'from pathlib import Path; workflow=Path(".github/workflows/quality.yml").read_text(); assert "--profile smoke --profile dashboard build --pull" in workflow; assert "--profile dashboard up -d --wait" in workflow; assert "npm --prefix tests/browser ci" in workflow; assert "DASHBOARD_URL=http://localhost:3000 npm --prefix tests/browser test -- compose.spec.js" in workflow; assert "npm --prefix tests/browser test -- dashboard.spec.js" in workflow; spec=Path("tests/browser/dashboard.spec.js").read_text(); assert "BROWSER_EVIDENCE_DIR" in spec and "test-results/evidence" in spec; compose=Path("tests/browser/compose.spec.js").read_text(); assert "unexpected" in compose and "dashboardURL" in compose'
+  [ "$status" -eq 0 ]
+}
+
+@test "dashboard operations handoff documents private access, recovery, and passkeys" {
+  run python3 -c 'from pathlib import Path; text=Path("docs/runbooks/dashboard.md").read_text(); required=("127.0.0.1:3000:3000", "SSH tunnel", "--public-origin", "unauthenticated", "--dry-run", "indicator-HMAC", "X-Forwarded-*", "WebAuthn RP ID"); assert all(item in text for item in required); backup=Path("docs/runbooks/backup-restore.md").read_text(); assert all(item in backup for item in ("dashboard-session-hmac-key", "control-api-token", "indicator-hmac-key")); readme=Path("README.md").read_text(); assert "dashboard operations runbook" in readme'
   [ "$status" -eq 0 ]
 }
 

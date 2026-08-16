@@ -41,6 +41,9 @@ before changing this path or the meaning of evidence.
 - Result and rejection rows are rebuildable projections; signed immutable
   artifacts remain authoritative. Keep the results API internal, token-gated,
   bounded, and free of raw mail, addresses, peer IPs, capabilities, and keys.
+- The dashboard is unauthenticated v1 local management only. Keep it on the
+  optional loopback-bound profile, off `public`, reject forwarded origin
+  headers, and never turn its opaque session correlation into a human identity.
 - Missing or invalid scanner data is unavailable/indeterminate, never a clean
   result. Security exceptions must be declared in
   `config/security-exceptions.yml` with owner, expiry, rationale, and a
@@ -59,6 +62,8 @@ before changing this path or the meaning of evidence.
 - `internal/admission/`, `internal/submitter/`, `internal/results/`: trusted
   sender admission, enrolled identity, rejection/result projections, and the
   authenticated internal read API.
+- `internal/dashboard/`, `internal/control/`: private HTML dashboard and typed
+  internal controls; browser traffic never receives API credentials.
 - `compose.yaml`, `containers/`, `config/`: production topology, images, pinned
   versions, and service configuration.
 - `compose.override.yaml`: automatically loaded source-build definitions. The

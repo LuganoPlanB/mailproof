@@ -1,12 +1,13 @@
 const { test, expect } = require('@playwright/test');
 const AxeBuilder = require('@axe-core/playwright').default;
+const evidenceDir = process.env.BROWSER_EVIDENCE_DIR || 'test-results/evidence';
 
 const shots = async (page, name, sizes) => {
   for (const [width, height, zoom] of sizes) {
     await page.setViewportSize({ width, height });
     await page.locator('html').evaluate((el, n) => { el.style.fontSize = `${n}%`; }, zoom);
     await expect(page.locator('main')).toBeVisible();
-    await page.screenshot({ path: `evidence/${name}-${width}x${height}-${zoom}.png`, fullPage: true });
+    await page.screenshot({ path: `${evidenceDir}/${name}-${width}x${height}-${zoom}.png`, fullPage: true });
   }
 };
 

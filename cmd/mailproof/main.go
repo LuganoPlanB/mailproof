@@ -162,8 +162,13 @@ func dashboardCommand(ctx context.Context, args []string) error {
 		}
 		config.Control = dashboard.ControlClient{BaseURL: u, Token: bytes.TrimSpace(t)}
 	}
-	server := &http.Server{Addr: net.JoinHostPort(*host, strconv.Itoa(*port)), Handler: dashboard.NewWithConfig(dashboard.ResultsClient{BaseURL: base, Token: bytes.TrimSpace(token)}, config), ReadHeaderTimeout: 2 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
-	go func() { <-ctx.Done(); _ = server.Shutdown(context.Background()) }()
+	server := &http.Server{Addr: net.JoinHostPort(*host, strconv.Itoa(*port)), Handler: dashboard.NewWithConfig(dashboard.ResultsClient{BaseURL: base, Token: bytes.TrimSpace(token)}, config), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdown)
+	}()
 	err = server.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
@@ -509,7 +514,7 @@ func controlAPI(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if err := controlLoopbackAddress(*listen); err != nil {
+	if err := controlListenAddress(*listen); err != nil {
 		return err
 	}
 	readKey := func(path, name string) ([]byte, error) {
@@ -561,19 +566,23 @@ func controlAPI(ctx context.Context, args []string) error {
 	return fmt.Errorf("serve control API: %w", err)
 }
 
-// controlLoopbackAddress protects bearer-authenticated control endpoints from
-// accidental exposure outside the local host.
-func controlLoopbackAddress(address string) error {
+// controlListenAddress permits a container-local wildcard listener only because
+// Compose confines control-api to the internal management network. Standalone
+// use remains loopback-only, preventing an accidental bearer API exposure.
+func controlListenAddress(address string) error {
 	host, port, err := net.SplitHostPort(address)
-	if err != nil || host == "" || port == "" {
-		return errors.New("control API listen address must be a loopback host and port")
+	if err != nil || port == "" {
+		return errors.New("control API listen address must have a valid host and port")
 	}
 	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
 		return errors.New("control API listen address has an invalid port")
 	}
+	if host == "" {
+		return nil
+	}
 	ip := net.ParseIP(host)
 	if ip == nil || !ip.IsLoopback() {
-		return errors.New("control API must bind only to a loopback address")
+		return errors.New("control API must bind to a loopback address or container-local wildcard")
 	}
 	return nil
 }
