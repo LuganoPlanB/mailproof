@@ -38,7 +38,7 @@
   run python3 -c 'import json, sys; project=json.loads(sys.argv[1]); services=project["services"]; smoke=services["smoke"]; volumes={v["target"]:v for v in smoke["volumes"]}; assert volumes["/var/mail/verification"]["read_only"]; assert not volumes["/state"].get("read_only", False); assert volumes["/run/secrets/capability-hmac-key"]["read_only"]; assert services["unbound"]["volumes"][0]["target"] == "/etc/unbound/unbound.conf.d/mailproof-smoke.conf"; assert set(services["unbound"]["networks"]) == {"analyzer", "admission-dns"}; assert project["networks"]["admission-dns"]["internal"]' "$config"
   [ "$status" -eq 0 ]
 
-  run python3 -c 'from pathlib import Path; text=Path("containers/smoke/entrypoint.sh").read_text(); assert "secrets.token_bytes(32)" in text; assert "smoke@smoke.mailproof.test" in text; assert "submission_capabilities" in text; assert "client.sendmail(sender" in text'
+  run python3 -c 'from pathlib import Path; smoke=Path("containers/smoke/entrypoint.sh").read_text(); unbound=Path("config/unbound-smoke.conf").read_text(); assert "secrets.token_bytes(32)" in smoke; assert "smoke@smoke.mailproof.test" in smoke; assert "submission_capabilities" in smoke; assert "client.sendmail(sender" in smoke; assert "interface: 0.0.0.0" in unbound; assert "interface: ::0" in unbound; assert "172.16.0.0/12 allow" in unbound'
   [ "$status" -eq 0 ]
 }
 
