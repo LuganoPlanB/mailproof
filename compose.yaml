@@ -64,7 +64,7 @@ services:
     image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-app"
     command: ["admission"]
     depends_on: {init: {condition: service_completed_successfully}}
-    networks: [mail]
+    networks: [mail, admission-dns]
     volumes:
       - state:/state
       - runtime:/runtime:ro
@@ -322,7 +322,7 @@ services:
   unbound:
     image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-unbound"
     environment: {MAILPROOF_ANALYZER_ROLE: unbound}
-    networks: [analyzer]
+    networks: [analyzer, admission-dns]
     volumes:
       # Reserved .test sender used only by the authenticated Compose smoke.
       - ./config/unbound-smoke.conf:/etc/unbound/unbound.conf.d/mailproof-smoke.conf:ro
@@ -418,6 +418,7 @@ networks:
   report: {internal: true}
   analytics: {internal: true}
   management: {internal: true}
+  admission-dns: {internal: true}
 
 volumes:
   runtime: {}
