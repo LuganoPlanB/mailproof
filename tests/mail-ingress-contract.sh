@@ -5,6 +5,8 @@ must() { rg -q -- "$2" "${root}/$1" || { printf 'missing %s in %s\n' "$2" "$1" >
 must config/postfix/main.cf 'message_size_limit = 52428800'
 must config/postfix/main.cf 'check_recipient_access texthash:/runtime/secrets/postfix-recipient-access'
 must config/postfix/main.cf 'check_policy_service inet:admission:10040, check_recipient_access'
+must containers/smoke/entrypoint.sh 'smoke@smoke.mailproof.test'
+must config/unbound-smoke.conf 'v=spf1 \+all'
 must config/postfix/main.cf 'reject_unauth_destination'
 must config/dovecot/dovecot.conf 'protocols = lmtp'
 must config/dovecot/sieve-before 'Routing only'

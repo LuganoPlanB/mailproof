@@ -30,6 +30,18 @@
   [ "$status" -eq 0 ]
 }
 
+@test "smoke profile exercises capability and SPF admission" {
+  run docker compose --env-file config/versions.env --profile smoke config --format json
+  [ "$status" -eq 0 ]
+  config=$output
+
+  run python3 -c 'import json, sys; services=json.loads(sys.argv[1])["services"]; smoke=services["smoke"]; volumes={v["target"]:v for v in smoke["volumes"]}; assert volumes["/var/mail/verification"]["read_only"]; assert not volumes["/state"].get("read_only", False); assert volumes["/run/secrets/capability-hmac-key"]["read_only"]; assert services["unbound"]["volumes"][0]["target"] == "/etc/unbound/unbound.conf.d/mailproof-smoke.conf"' "$config"
+  [ "$status" -eq 0 ]
+
+  run python3 -c 'from pathlib import Path; text=Path("containers/smoke/entrypoint.sh").read_text(); assert "secrets.token_bytes(32)" in text; assert "smoke@smoke.mailproof.test" in text; assert "submission_capabilities" in text; assert "client.sendmail(sender" in text'
+  [ "$status" -eq 0 ]
+}
+
 @test "dashboard profile confines browser and control services to their least-privilege networks" {
   run docker compose --env-file config/versions.env --profile dashboard config --format json
   [ "$status" -eq 0 ]

@@ -293,8 +293,19 @@ services:
     environment:
       MAILPROOF_VERIFY_RECIPIENT: ${MAILPROOF_VERIFY_RECIPIENT:-verify@mailproof.test}
       MAILPROOF_SMOKE_MESSAGE_ID: ${MAILPROOF_SMOKE_MESSAGE_ID:-mailproof-smoke}
+      MAILPROOF_SMOKE_STATE: /state/mailproof.sqlite
+      MAILPROOF_SMOKE_CAPABILITY_KEY: /run/secrets/capability-hmac-key
     networks: [public]
-    volumes: [maildir:/var/mail/verification:ro]
+    volumes:
+      - maildir:/var/mail/verification:ro
+      # The smoke profile provisions only its synthetic identity in disposable
+      # test state; production services never receive this test-only adapter.
+      - state:/state
+      - type: volume
+        source: runtime
+        target: /run/secrets/capability-hmac-key
+        read_only: true
+        volume: {subpath: secrets/capability-hmac-key}
     restart: "no"
     logging: *logging
 
@@ -312,6 +323,9 @@ services:
     image: "${MAILPROOF_IMAGE:-ghcr.io/luganoplanb/mailproof}:${MAILPROOF_VERSION:-dev}-unbound"
     environment: {MAILPROOF_ANALYZER_ROLE: unbound}
     networks: [analyzer]
+    volumes:
+      # Reserved .test sender used only by the authenticated Compose smoke.
+      - ./config/unbound-smoke.conf:/etc/unbound/unbound.conf.d/mailproof-smoke.conf:ro
     # Debian's default config creates control/pid files, binds port 53, and
     # drops to the unbound package user during bootstrap.
     cap_add: [CHOWN, NET_BIND_SERVICE, SETGID, SETUID]
