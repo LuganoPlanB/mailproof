@@ -26,7 +26,7 @@
   [ "$status" -eq 0 ]
   config=$output
 
-  run python3 -c 'import json, sys; services=json.loads(sys.argv[1])["services"]; admission=services["admission"]; collector=services["collector"]; api=services["results-api"]; assert set(admission["networks"]) == {"mail"}; assert "--admission-stamp-key" in collector["command"]; assert "--subject-domain-allowlist" in collector["command"]; assert collector["healthcheck"]["test"][-1] == "test -f /state/mailproof.sqlite"; assert set(api["networks"]) == {"analytics"}; assert api["depends_on"]["collector"]["condition"] == "service_healthy"; assert "ports" not in api; assert any(volume["target"] == "/artifacts" and volume["read_only"] for volume in api["volumes"]); assert "results-api-token" in api["healthcheck"]["test"][-1]' "$config"
+  run python3 -c 'import json, sys; services=json.loads(sys.argv[1])["services"]; admission=services["admission"]; collector=services["collector"]; api=services["results-api"]; assert set(admission["networks"]) == {"mail", "admission-dns"}; assert "--admission-stamp-key" in collector["command"]; assert "--subject-domain-allowlist" in collector["command"]; assert collector["healthcheck"]["test"][-1] == "test -f /state/mailproof.sqlite"; assert set(api["networks"]) == {"analytics"}; assert api["depends_on"]["collector"]["condition"] == "service_healthy"; assert "ports" not in api; assert any(volume["target"] == "/artifacts" and volume["read_only"] for volume in api["volumes"]); assert "results-api-token" in api["healthcheck"]["test"][-1]' "$config"
   [ "$status" -eq 0 ]
 }
 
@@ -35,7 +35,7 @@
   [ "$status" -eq 0 ]
   config=$output
 
-  run python3 -c 'import json, sys; services=json.loads(sys.argv[1])["services"]; smoke=services["smoke"]; volumes={v["target"]:v for v in smoke["volumes"]}; assert volumes["/var/mail/verification"]["read_only"]; assert not volumes["/state"].get("read_only", False); assert volumes["/run/secrets/capability-hmac-key"]["read_only"]; assert services["unbound"]["volumes"][0]["target"] == "/etc/unbound/unbound.conf.d/mailproof-smoke.conf"' "$config"
+  run python3 -c 'import json, sys; project=json.loads(sys.argv[1]); services=project["services"]; smoke=services["smoke"]; volumes={v["target"]:v for v in smoke["volumes"]}; assert volumes["/var/mail/verification"]["read_only"]; assert not volumes["/state"].get("read_only", False); assert volumes["/run/secrets/capability-hmac-key"]["read_only"]; assert services["unbound"]["volumes"][0]["target"] == "/etc/unbound/unbound.conf.d/mailproof-smoke.conf"; assert set(services["unbound"]["networks"]) == {"analyzer", "admission-dns"}; assert project["networks"]["admission-dns"]["internal"]' "$config"
   [ "$status" -eq 0 ]
 
   run python3 -c 'from pathlib import Path; text=Path("containers/smoke/entrypoint.sh").read_text(); assert "secrets.token_bytes(32)" in text; assert "smoke@smoke.mailproof.test" in text; assert "submission_capabilities" in text; assert "client.sendmail(sender" in text'
